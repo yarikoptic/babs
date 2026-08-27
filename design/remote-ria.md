@@ -155,7 +155,7 @@ Two sites deserve individual attention.
 reads the push URL datalad recorded for the `output` sibling and then discards
 everything but the path component:
 
-```python
+```
 self.output_ria_data_dir = urlparse(
     proc_output_ria_data_dir.stdout.decode('utf-8')
 ).path.strip()
@@ -237,18 +237,18 @@ New module `babs/remotes.py`. Deliberately ignorant of RIA:
 class Remote:
     """A git(-annex) remote that BABS pushes to or clones from."""
 
-    name: str                      # datalad sibling name: 'input' | 'output'
-    url: str                       # git URL for refs — any transport
+    name: str  # datalad sibling name: 'input' | 'output'
+    url: str  # git URL for refs — any transport
     content_sibling: str | None = None
-        # datalad sibling holding annex content.
-        # RIA -> 'output-storage'; plain annex remote -> None, meaning `name` itself.
-        # Input side is always None-with-no-content.
+    # datalad sibling holding annex content.
+    # RIA -> 'output-storage'; plain annex remote -> None, meaning `name` itself.
+    # Input side is always None-with-no-content.
 
     # --- pure git; identical for file/ssh/http ------------------------
-    def exists(self) -> bool: ...                      # git ls-remote --exit-code
-    def head_hash(self) -> str | None: ...             # git ls-remote HEAD
-    def results_branches(self, timeout=30) -> list[str]: ...   # git ls-remote --heads
-    def delete_branches(self, branches: list[str]) -> None: ...# git push --delete
+    def exists(self) -> bool: ...  # git ls-remote --exit-code
+    def head_hash(self) -> str | None: ...  # git ls-remote HEAD
+    def results_branches(self, timeout=30) -> list[str]: ...  # git ls-remote --heads
+    def delete_branches(self, branches: list[str]) -> None: ...  # git push --delete
 
     @classmethod
     def from_sibling(cls, analysis_path: str, name: str) -> 'Remote':
@@ -257,7 +257,7 @@ class Remote:
     @property
     def is_local(self) -> bool: ...
     @property
-    def local_path(self) -> str | None: ...            # None unless file/plain path
+    def local_path(self) -> str | None: ...  # None unless file/plain path
 ```
 
 The word "RIA" does not appear in this class. `merge.py`, `status`,
@@ -268,16 +268,22 @@ The word "RIA" does not appear in this class. `merge.py`, `status`,
 ```python
 class Provisioner(Protocol):
     def provision(self, ds, name: str, shared_group: str | None) -> Remote: ...
-    def teardown_hint(self) -> str: ...   # what to tell the user on init failure
+    def teardown_hint(self) -> str: ...  # what to tell the user on init failure
+
 
 class RIAProvisioner:
     """Today's behaviour. Creates the store if absent."""
+
     def __init__(self, store_url: str, with_content: bool): ...
+
     # create_sibling_ria(..., alias='data' for output), then Remote.from_sibling()
+
 
 class ExistingRemoteProvisioner:
     """The user hands us a remote that already exists. Nothing to create."""
+
     def __init__(self, url: str, content_sibling: str | None): ...
+
     # datalad siblings add; verify pushable; then Remote.from_sibling()
 ```
 
@@ -290,7 +296,7 @@ without touching anything else.
 ### 3. `BABS` attribute changes
 
 ```python
-self.input_remote  = Remote.from_sibling(self.analysis_path, 'input')
+self.input_remote = Remote.from_sibling(self.analysis_path, 'input')
 self.output_remote = Remote.from_sibling(self.analysis_path, 'output')
 ```
 
@@ -367,8 +373,9 @@ Replace the `readlink`/`op.exists`/path-comparison block (G) with:
 for remote in (self.input_remote, self.output_remote):
     if not remote.exists():
         raise FileNotFoundError(f"'{remote.name}' remote not reachable: {remote.url}")
-    compare_hashes(get_repo_hash(self.analysis_path), remote.head_hash(),
-                   'analysis', f'{remote.name} remote')
+    compare_hashes(
+        get_repo_hash(self.analysis_path), remote.head_hash(), 'analysis', f'{remote.name} remote'
+    )
 ```
 
 `compare_repo_commit_hashes(repo1, repo2, …)` (`utils.py:592`) currently takes
@@ -384,7 +391,7 @@ and hash checks above, which test what actually matters.
 `container.py:278-280` becomes:
 
 ```python
-dssource      = babs.input_remote.url          # no '#' + dataset_id
+dssource = babs.input_remote.url  # no '#' + dataset_id
 pushgitremote = babs.output_remote.url
 ```
 
