@@ -4,6 +4,7 @@ Everything here runs against real `git init --bare` fixtures in `tmp_path`;
 no datalad, no cluster, no network.
 """
 
+import os
 import subprocess
 
 import pytest
@@ -99,11 +100,14 @@ class TestBareGitCreation:
         remote._ensure_annex()
         assert remote.annex_uuid() == first
 
-    def test_rejects_a_non_bare_directory(self, tmp_path):
-        not_bare = tmp_path / 'plain'
-        not_bare.mkdir()
-        with pytest.raises(ValueError, match='not a bare git repository'):
-            BareGitOutputRemote(str(not_bare))._ensure_bare_repo()
+    def test_accepts_an_existing_empty_directory(self, tmp_path):
+        """An empty directory is a fine place to `git init --bare` into; only a
+        directory holding something else must be refused."""
+        empty = tmp_path / 'plain'
+        empty.mkdir()
+        remote = BareGitOutputRemote(str(empty))
+        remote._ensure_bare_repo()
+        assert remote._is_bare_repo()
 
     def test_rejects_a_working_tree_repo(self, tmp_path):
         work = tmp_path / 'work'
@@ -117,11 +121,8 @@ class TestPublicationContract:
 
     def test_ria_job_stanza_is_the_historical_text(self, tmp_path):
         remote = RiaOutputRemote(str(tmp_path / 'output_ria'))
-        assert remote.job_content_push_block == (
-            '# push result file content to output RIA storage:\n'
-            "echo '# Push result file content to output RIA storage:'\n"
-            'datalad push --to output-storage'
-        )
+        assert remote.job_content_push_echo == '# Push result file content to output RIA storage:'
+        assert remote.job_content_push_command == 'datalad push --to output-storage'
         assert remote.merge_content_remote == 'output-storage'
 
     def test_bare_git_content_push_targets_the_same_remote_as_the_ref_push(self, tmp_path):
@@ -261,3 +262,35 @@ class TestAnnexContentActuallyArrives:
 
         _git('push', 'outputstore', 'job-1-1-sub-01', cwd=src)
         assert set(list_result_branches(str(bare))) == {'job-1-1-sub-01'}
+
+
+class TestProvisioningGuards:
+    """Each guard here corresponds to a way the store can be silently wrong."""
+
+    def test_existing_non_empty_non_repo_is_refused(self, tmp_path):
+        """A typo in --output-remote must not scatter git internals into data."""
+        target = tmp_path / 'my-data'
+        target.mkdir()
+        (target / 'paper.txt').write_text('important')
+        with pytest.raises(ValueError, match='not empty'):
+            BareGitOutputRemote(str(target))._ensure_bare_repo()
+        assert sorted(os.listdir(target)) == ['paper.txt']
+
+    def test_existing_empty_directory_is_initialised(self, tmp_path):
+        target = tmp_path / 'out.git'
+        target.mkdir()
+        remote = BareGitOutputRemote(str(target))
+        remote._ensure_bare_repo()
+        remote._ensure_annex()
+        assert remote.annex_uuid()
+
+    @pytest.mark.parametrize(
+        'url',
+        ['git@host:out.git', 'user@host:/srv/out.git', 'ssh://host/out.git', 'out.git'],
+    )
+    def test_non_local_or_relative_urls_are_refused(self, url):
+        """scp-style URLs have no scheme, so a naive check treats them as paths
+        and would `git init --bare` a local directory named `git@host:out.git`
+        while every job pushes over ssh to a host that was never annex-inited."""
+        with pytest.raises(ValueError, match='local path'):
+            BareGitOutputRemote(url)

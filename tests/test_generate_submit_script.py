@@ -326,18 +326,24 @@ _PUBLICATION_KWARGS = {
 }
 
 # What the script has always contained for the (default) output RIA store.
-_RIA_PUBLICATION_STANZA = (
-    '# Finish up:\n'
-    '# push result file content to output RIA storage:\n'
-    "echo '# Push result file content to output RIA storage:'\n"
-    'datalad push --to output-storage\n'
+#: The two executable lines the RIA default has always emitted. Comments around
+#: them were rewritten to state the two-phase invariant where a reader of the
+#: generated script sees it; the *executable* text must not drift.
+_RIA_PUBLICATION_LINES = (
+    "echo '# Push result file content to output RIA storage:'\ndatalad push --to output-storage\n"
 )
+
+
+def _executable_lines(script):
+    return [
+        line for line in script.splitlines() if line.strip() and not line.lstrip().startswith('#')
+    ]
 
 
 def test_default_publication_stanza_is_unchanged():
     """The RIA default must render exactly as it did before providers existed."""
     script = generate_submit_script(**_PUBLICATION_KWARGS)
-    assert _RIA_PUBLICATION_STANZA in script
+    assert _RIA_PUBLICATION_LINES in script
 
 
 def test_explicit_ria_provider_matches_the_default():
@@ -360,3 +366,27 @@ def test_bare_git_publishes_content_to_the_same_remote_as_the_branch(tmp_path):
     # Content first, the result branch (the completion marker) last.
     assert content_at < ref_at
     assert 'flock' in script[script.rindex('\n', 0, ref_at) : ref_at]
+
+
+def test_bare_git_differs_from_ria_only_in_the_content_push():
+    """The provider must change one command, not the shape of the job.
+
+    Everything else about a participant job -- the clone, the run, the flocked
+    result-ref push that marks completion -- is identical for both receivers.
+    Anything else showing up in this diff is scope the provider should not have.
+    """
+    from babs.output_remote import BareGitOutputRemote
+
+    ria = _executable_lines(generate_submit_script(**_PUBLICATION_KWARGS))
+    bare = _executable_lines(
+        generate_submit_script(
+            output_remote=BareGitOutputRemote('/srv/out.git'), **_PUBLICATION_KWARGS
+        )
+    )
+    differing = [(a, b) for a, b in zip(ria, bare, strict=True) if a != b]
+    # Exactly two: the progress `echo` (RIA keeps its historical wording) and
+    # the content-push command itself.
+    assert len(differing) == 2, differing
+    assert all(a.startswith('echo ') for a in differing[0])
+    assert differing[1][0] == 'datalad push --to output-storage'
+    assert differing[1][1].startswith('git annex copy --to outputstore')

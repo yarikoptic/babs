@@ -179,7 +179,10 @@ def delete_result_branches(url, branch_oids, timeout=DEFAULT_TIMEOUT):
     """
     if not branch_oids:
         return ''
-    args = ['git', 'push', '--delete']
+    # --atomic: one refused lease must not leave the other branches in the
+    # chunk deleted. The caller only sees an exception and cannot tell which
+    # refs went through, so a partial delete would silently drop results.
+    args = ['git', 'push', '--atomic', '--delete']
     for name, oid in branch_oids.items():
         args.append(f'--force-with-lease={_HEADS_PREFIX}{name}:{oid}')
     args.append(str(url))

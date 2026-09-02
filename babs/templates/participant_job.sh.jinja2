@@ -187,7 +187,12 @@ datalad run \
     "bash ./{{ run_script_relpath if run_script_relpath else 'code/' + container_name + '_zip.sh' }} {% raw %}${subid}{% endraw %} {% if processing_level == 'session' %} {% raw %}${sesid}{% endraw %}{% endif %}{% for input_dataset in input_datasets %}{% if input_dataset['is_zipped'] %} ${%raw%}{{%endraw%}{{ input_dataset['name'] | shell_safe }}_ZIP{%raw%}}{%endraw%}{%endif%}{%endfor%}"
 
 # Finish up:
-{{ content_push_block }}
+# Results are published in two phases. The file *content* goes first; the
+# result branch is pushed last, under flock, and is the completion marker that
+# `babs status` and `babs merge` read. Never reorder these: a result ref that
+# is visible must always imply content that is retrievable.
+echo '{{ content_push_echo }}'
+{{ content_push_command }}
 
 # push the output branch:
 echo '# Push the branch with provenance records:'

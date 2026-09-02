@@ -139,12 +139,15 @@ def generate_submit_script(
         container_image_paths=container_image_paths,
         datalad_run_message=datalad_run_message,
         analysis_path=analysis_path,
-        content_push_block=(
-            RiaOutputRemote('').job_content_push_block
-            if output_remote is None
-            else output_remote.job_content_push_block
-        ),
+        content_push_echo=_remote_or_default(output_remote).job_content_push_echo,
+        content_push_command=_remote_or_default(output_remote).job_content_push_command,
     )
+
+
+def _remote_or_default(output_remote):
+    """`None` means the default RIA receiver -- the same thing an absent
+    `output_remote:` config section means for a pre-existing project."""
+    return RiaOutputRemote('') if output_remote is None else output_remote
 
 
 def generate_test_submit_script(

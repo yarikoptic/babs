@@ -45,6 +45,32 @@ RIA_CONTENT_PUSH_COMMAND = 'datalad push --to output-storage'
 RIA_CONTENT_SIBLING = 'output-storage'
 
 
+def _is_local_path(url):
+    """Whether ``url`` names a path on this filesystem.
+
+    Three forms are *not* local, and only the first is obvious:
+
+    * a real URL -- ``ssh://host/x``, ``https://host/x``;
+    * git's scp-style ssh syntax -- ``git@host:x``, ``user@host:/srv/x``,
+      ``host:/srv/x``. These carry no ``://`` and no scheme ``urlparse`` will
+      report, so a naive check treats them as paths: BABS would then
+      ``git init --bare`` a local directory literally named ``git@host:x``
+      while every job pushes over ssh to a host that was never annex-inited,
+      and the content would go nowhere. Git's own rule is: no ``://``, and a
+      colon before the first slash.
+    * a relative path -- git resolves a relative remote against ``analysis/``,
+      not the directory ``babs init`` ran in, so the store BABS prepares and
+      the one jobs push to would be different directories.
+    """
+    if url.startswith('file://'):
+        url = url[len('file://') :]
+    elif '://' in url:
+        return False
+    if ':' in url.split('/', 1)[0]:
+        return False
+    return op.isabs(url)
+
+
 class OutputRemote:
     """Base class: the place a BABS project publishes job results to."""
 
@@ -82,11 +108,6 @@ class OutputRemote:
     # names/commands baked into generated code
     # ------------------------------------------------------------------
     @property
-    def job_content_push_comment(self):
-        """Source comment above the content push in ``participant_job.sh``."""
-        raise NotImplementedError
-
-    @property
     def job_content_push_echo(self):
         """The ``echo`` line preceding the content push in ``participant_job.sh``."""
         raise NotImplementedError
@@ -95,20 +116,6 @@ class OutputRemote:
     def job_content_push_command(self):
         """The shell command that publishes annexed content from a job."""
         raise NotImplementedError
-
-    @property
-    def job_content_push_block(self):
-        """The whole content-publication stanza of ``participant_job.sh``.
-
-        This is phase one of the two-phase publication: content first, then
-        the result branch pushed last under ``flock`` as the marker that the
-        job finished. It must not push any ref.
-        """
-        return (
-            f'{self.job_content_push_comment}\n'
-            f"echo '{self.job_content_push_echo}'\n"
-            f'{self.job_content_push_command}'
-        )
 
     @property
     def merge_content_remote(self):
@@ -171,10 +178,6 @@ class RiaOutputRemote(OutputRemote):
         return self.url + '#' + analysis_dataset_id
 
     @property
-    def job_content_push_comment(self):
-        return RIA_CONTENT_PUSH_COMMENT
-
-    @property
     def job_content_push_echo(self):
         return RIA_CONTENT_PUSH_ECHO
 
@@ -201,7 +204,8 @@ class BareGitOutputRemote(OutputRemote):
 
     def __init__(self, url):
         super().__init__(url)
-        if '://' in self.url or self.url.startswith('git@'):
+        self.url = self.url.removeprefix('file://')
+        if not _is_local_path(self.url):
             raise ValueError(
                 f"'--output-remote {self.url}' is not a local path. BABS can only "
                 'guarantee that a bare repository is git-annex-initialized (and so '
@@ -217,23 +221,43 @@ class BareGitOutputRemote(OutputRemote):
         self._ensure_bare_repo(shared)
         self._ensure_annex()
         dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
+        # Be explicit rather than trusting git-annex's probe: were it ever to
+        # fail transiently, the cached `annex-ignore=true` would turn every
+        # later content push into a silent no-op.
+        subprocess.run(
+            ['git', 'config', f'remote.{GIT_SIBLING_NAME}.annex-ignore', 'false'],
+            cwd=dataset.path,
+            check=True,
+        )
 
     def _ensure_bare_repo(self, shared=None):
         """Create the bare repository if needed; validate it if it exists."""
         if op.exists(self.repo_path):
-            if not self._is_bare_repo():
+            if self._is_bare_repo():
+                return
+            if os.listdir(self.repo_path):
+                # Either a non-bare repo (which would refuse pushes to its
+                # checked-out branch) or somebody's data -- a typo in
+                # `--output-remote` must not scatter git internals into it.
                 raise ValueError(
                     f"'--output-remote {self.repo_path}' exists but is not a bare git "
-                    'repository. Please point `--output-remote` at a bare repository '
-                    '(`git init --bare`) or at a path that does not exist yet.'
+                    'repository, and is not empty. Point `--output-remote` at a bare '
+                    'repository (`git init --bare`), an empty directory, or a path '
+                    'that does not exist yet.'
                 )
-            return
+            # An existing empty directory is fine: initialise into it.
         os.makedirs(op.dirname(self.repo_path), exist_ok=True)
         cmd = ['git', 'init', '--bare']
         if shared:
             cmd.append(f'--shared={shared}')
         cmd.append(self.repo_path)
         subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if shared and shared != 'group':
+            # `--shared=<group-name>` sets the permission bits; the group
+            # ownership itself still has to be applied, as create_sibling_ria
+            # does for a RIA store. Without it a second member's job cannot
+            # write its results.
+            subprocess.run(['chgrp', '-R', shared, self.repo_path], check=False)
 
     def _is_bare_repo(self):
         proc = subprocess.run(
@@ -284,10 +308,6 @@ class BareGitOutputRemote(OutputRemote):
         return git_endpoint
 
     # ---------------- generated code ----------------
-    @property
-    def job_content_push_comment(self):
-        return '# push result file content to the output remote:'
-
     @property
     def job_content_push_echo(self):
         return '# Push result file content to the output remote:'
