@@ -142,6 +142,17 @@ def _parse_init():
         metavar='ENTRY',
         help="Skip adding ENTRY to the generated .gitignore. Currently supported: 'logs'.",
     )
+    parser.add_argument(
+        '--output_remote',
+        '--output-remote',
+        type=str,
+        metavar='PATH',
+        help='Path to a plain bare git repository that should receive the job results '
+        '(both the result branches and the annexed result content). '
+        'It is created if it does not exist, and is initialized as a git-annex '
+        'repository so that result *content* can actually be stored there. '
+        'By default, BABS creates and uses an output RIA store inside the project root.',
+    )
 
     return parser
 
@@ -175,6 +186,7 @@ def babs_init_main(
     throttle: int | None = None,
     shared_group: str | None = None,
     no_ignore: list | None = None,
+    output_remote: str | None = None,
 ):
     """This is the core function of babs init.
 
@@ -213,6 +225,9 @@ def babs_init_main(
         with `--shared group --group <GROUP>`.
     no_ignore: list or None, optional
         List of entries to omit from the generated .gitignore. Supported: 'logs'.
+    output_remote: str or None, optional
+        Path to a plain bare git repository that should receive the job results.
+        `None` (the default) keeps the in-project output RIA store.
     """
 
     from babs import BABSBootstrap
@@ -228,6 +243,7 @@ def babs_init_main(
             throttle=throttle,
             shared_group=shared_group,
             no_ignore=no_ignore,
+            output_remote=output_remote,
         )
     except Exception:
         print('\n`babs init` failed! Below is the error message:')

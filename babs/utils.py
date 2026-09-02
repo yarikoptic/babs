@@ -13,6 +13,9 @@ import pandas as pd
 import yaml
 from filelock import FileLock, Timeout
 
+from babs.git_endpoint import DEFAULT_TIMEOUT as DEFAULT_GIT_ENDPOINT_TIMEOUT
+from babs.git_endpoint import list_result_branches
+
 RUNNING_PYTEST = os.environ.get('RUNNING_PYTEST', '0') == '1'
 
 
@@ -463,44 +466,35 @@ def get_results_branches_from_clone(clone_path):
     return branches
 
 
-def get_results_branches_from_ria(ria_data_dir, timeout=30):
+def get_results_branches_from_ria(ria_data_dir, timeout=DEFAULT_GIT_ENDPOINT_TIMEOUT):
     """
-    List job-* branches in output RIA via git ls-remote (avoids hang in CI).
+    List job-* branches in the output remote via git ls-remote.
 
-    Use this instead of get_results_branches(ria_directory) when listing
-    branches in the RIA store can hang (e.g. in CI). Does not require
-    a clone or changing into the RIA directory.
+    Unlike get_results_branches(ria_directory) this takes a URL as readily as
+    a path and does not change directory, so it also works when the output
+    remote is not a directory on this machine.
 
     Parameters
     ----------
     ria_data_dir : str
-        Path or URL to the output RIA (git repo).
+        Path or URL to the output remote (git repo).
     timeout : int, optional
         Timeout in seconds for the git ls-remote call.
 
     Returns
     -------
     list of str
-        Branch names (e.g. job-0001-sub-01).
+        Branch names (e.g. job-0001-sub-01), sorted.
+
+    Raises
+    ------
+    babs.git_endpoint.GitEndpointError
+        If the endpoint cannot be reached. This deliberately does *not*
+        return an empty list on failure: a transport or permission error
+        reported as "no results" would make `babs status` claim that no job
+        ever finished and `babs merge` refuse to merge results that exist.
     """
-    out = subprocess.run(
-        ['git', 'ls-remote', '--heads', ria_data_dir],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if out.returncode != 0:
-        return []
-    branches = []
-    for line in (out.stdout or '').strip().splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        ref = parts[1]
-        if ref.startswith('refs/heads/job-'):
-            branches.append(ref.replace('refs/heads/', ''))
-    return branches
+    return sorted(list_result_branches(ria_data_dir, timeout=timeout))
 
 
 def identify_running_jobs(last_submitted_jobs_df, currently_running_df):

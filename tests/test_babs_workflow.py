@@ -266,6 +266,7 @@ def test_init_forwards_shared_group(tmp_path):
         throttle=None,
         shared_group='my-lab-group',
         no_ignore=[],
+        output_remote=None,
     )
     with (
         mock.patch.object(argparse.ArgumentParser, 'parse_args', return_value=options),
@@ -286,6 +287,7 @@ def test_init_forwards_shared_group(tmp_path):
         throttle=options.throttle,
         shared_group=options.shared_group,
         no_ignore=options.no_ignore,
+        output_remote=options.output_remote,
     )
 
 
@@ -303,6 +305,7 @@ def test_init_forwards_no_ignore(tmp_path):
         throttle=None,
         shared_group=None,
         no_ignore=['logs'],
+        output_remote=None,
     )
     with (
         mock.patch.object(argparse.ArgumentParser, 'parse_args', return_value=options),
@@ -323,6 +326,7 @@ def test_init_forwards_no_ignore(tmp_path):
         throttle=options.throttle,
         shared_group=options.shared_group,
         no_ignore=options.no_ignore,
+        output_remote=options.output_remote,
     )
 
 

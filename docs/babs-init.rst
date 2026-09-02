@@ -113,6 +113,35 @@ a SLURM cluster:
     e.g., ``--array=1-${max_array}%10``.
 
 .. note::
+    **Publishing results somewhere other than an output RIA store**: by default
+    ``babs init`` creates an output RIA store inside the BABS project root, and
+    results are published to it over two channels -- the result branches go to a
+    bare git repository inside the store, and the zipped results go to an ORA
+    special remote.
+
+    ``--output-remote /path/to/output.git`` replaces both with a single **plain
+    bare git repository**::
+
+        babs init \
+            --container_ds /path/to/container-ds \
+            --container_name mriqc-24-0-2 \
+            --container_config /path/to/container_mriqc.yaml \
+            --processing_level subject \
+            --queue slurm \
+            --output-remote /path/to/output.git \
+            /path/to/my_BABS_project
+
+    The repository is created if it does not exist, and BABS runs ``git annex
+    init`` in it. That step is not cosmetic: a bare repository with no
+    ``annex.uuid`` is treated by git-annex as a git-only remote, and result
+    *content* is then silently not transferred at all, leaving result branches
+    that point at zip files stored nowhere. ``babs check-setup`` re-checks this.
+
+    Everything else is unchanged: ``babs status``, ``babs merge`` and a
+    ``datalad clone`` of the repository work the same way, and jobs still push
+    content first and the result branch last.
+
+.. note::
     **Shared group permissions**: On multi-user shared filesystems:
 
     #. **Set ``umask 002``** in your shell startup (for example ``~/.bashrc``). This is

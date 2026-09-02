@@ -163,6 +163,7 @@ class Container:
         system,
         analysis_path=None,
         shared_group_mode=False,
+        output_remote=None,
     ):
         """Generate bash script for participant job.
 
@@ -181,6 +182,8 @@ class Container:
             script to locate shared container images.
         shared_group_mode : bool, optional
             If True, align generated script permissions with shared-group mode.
+        output_remote : babs.output_remote.OutputRemote, optional
+            Where the job publishes its results.
         """
         if analysis_path is None:
             raise ValueError('analysis_path is required')
@@ -196,6 +199,7 @@ class Container:
             zip_foldernames=self.config['zip_foldernames'],
             container_images=[self.container_path_relToAnalysis],
             analysis_path=analysis_path,
+            output_remote=output_remote,
         )
 
         with open(bash_path, 'w') as f:

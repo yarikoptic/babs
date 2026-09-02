@@ -308,3 +308,55 @@ def test_find_single_zip_handles_regex_metachars_in_name(name, processing_level,
 
     assert result.returncode == 0, result.stderr
     assert zipname in result.stdout, f'zip not located:\nOUT:{result.stdout}\nERR:{result.stderr}'
+
+
+# ---------------------------------------------------------------------------
+# Result publication: which endpoint, and in which order.
+# ---------------------------------------------------------------------------
+_PUBLICATION_KWARGS = {
+    'queue_system': 'slurm',
+    'cluster_resources_config': {'interpreting_shell': '/bin/bash'},
+    'script_preamble': '',
+    'job_scratch_directory': '/tmp',
+    'input_datasets': input_datasets_prep,
+    'processing_level': 'subject',
+    'container_name': 'mriqc-24-0-2',
+    'zip_foldernames': {'mriqc': '24-0-2'},
+    'analysis_path': '/proj/analysis',
+}
+
+# What the script has always contained for the (default) output RIA store.
+_RIA_PUBLICATION_STANZA = (
+    '# Finish up:\n'
+    '# push result file content to output RIA storage:\n'
+    "echo '# Push result file content to output RIA storage:'\n"
+    'datalad push --to output-storage\n'
+)
+
+
+def test_default_publication_stanza_is_unchanged():
+    """The RIA default must render exactly as it did before providers existed."""
+    script = generate_submit_script(**_PUBLICATION_KWARGS)
+    assert _RIA_PUBLICATION_STANZA in script
+
+
+def test_explicit_ria_provider_matches_the_default():
+    from babs.output_remote import RiaOutputRemote
+
+    assert generate_submit_script(**_PUBLICATION_KWARGS) == generate_submit_script(
+        output_remote=RiaOutputRemote('/proj/output_ria'), **_PUBLICATION_KWARGS
+    )
+
+
+def test_bare_git_publishes_content_to_the_same_remote_as_the_branch(tmp_path):
+    from babs.output_remote import BareGitOutputRemote
+
+    script = generate_submit_script(
+        output_remote=BareGitOutputRemote(str(tmp_path / 'out.git')), **_PUBLICATION_KWARGS
+    )
+    assert 'datalad push --to output-storage' not in script
+    content_at = script.index('git annex copy --to outputstore')
+    ref_at = script.index('git push outputstore')
+    # Content first, the result branch (the completion marker) last.
+    assert content_at < ref_at
+    assert 'flock' in script[script.rindex('\n', 0, ref_at) : ref_at]

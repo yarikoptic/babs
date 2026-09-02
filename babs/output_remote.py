@@ -1,0 +1,354 @@
+"""Where a BABS project publishes the results of its jobs.
+
+Publication has **two channels**, and both of them have to reach the same
+place for results to be usable:
+
+1. *git refs* -- one ``job-<id>-<task>-<sub>`` branch per finished job, holding
+   the provenance and the annex pointers.  ``participant_job.sh`` pushes this
+   last, under ``flock``, as the completion marker of the job.
+2. *git-annex content* -- the actual zip files.  ``participant_job.sh`` pushes
+   this **first**, so that a visible result branch always implies retrievable
+   content.
+
+For the historical (and default) RIA layout the two channels are separate
+endpoints: a bare git repository inside the store for the refs, and an ORA
+special remote (recorded in the ``git-annex`` branch with ``autoenable=true``)
+for the content.
+
+This module keeps that default byte-for-byte intact and adds a second
+provider, in which a **plain bare git repository** carries both channels over
+a single URL.  For annexed content to actually arrive in a plain bare
+repository, the repository must itself be a git-annex repository -- a bare
+repo that has never had ``git annex init`` run in it has no ``annex.uuid``,
+so ``datalad push`` reports ``copy (notneeded)`` and silently transfers
+nothing.  :meth:`BareGitOutputRemote.create_sibling` guarantees this.
+"""
+
+import os
+import os.path as op
+import subprocess
+
+#: Name of the datalad sibling that receives the result *git refs*.
+GIT_SIBLING_NAME = 'output'
+
+#: Name that ``participant_job.sh`` gives the result git remote inside a job.
+JOB_GIT_REMOTE_NAME = 'outputstore'
+
+#: What ``participant_job.sh`` echoes/runs to publish content in a RIA project.
+#: These strings reproduce the pre-existing template text exactly, so that the
+#: default (RIA) ``participant_job.sh`` is unchanged.
+RIA_CONTENT_PUSH_COMMENT = '# push result file content to output RIA storage:'
+RIA_CONTENT_PUSH_ECHO = '# Push result file content to output RIA storage:'
+RIA_CONTENT_PUSH_COMMAND = 'datalad push --to output-storage'
+
+#: Name of the ORA special remote created by ``datalad create-sibling-ria``.
+RIA_CONTENT_SIBLING = 'output-storage'
+
+
+class OutputRemote:
+    """Base class: the place a BABS project publishes job results to."""
+
+    #: Value recorded under ``output_remote.type`` in ``babs_proj_config.yaml``.
+    type = None
+
+    def __init__(self, url):
+        self.url = str(url)
+
+    def __repr__(self):
+        return f'{type(self).__name__}({self.url!r})'
+
+    # ------------------------------------------------------------------
+    # `babs init`
+    # ------------------------------------------------------------------
+    def create_sibling(self, dataset, sibling_kwargs):
+        """Create the ``output`` sibling (and its content channel) of `dataset`."""
+        raise NotImplementedError
+
+    def finalize(self, git_endpoint):
+        """Run any post-``datalad push`` setup.  `git_endpoint` is the git URL."""
+
+    # ------------------------------------------------------------------
+    # addressing
+    # ------------------------------------------------------------------
+    def resolve_git_endpoint(self, recorded_push_url):
+        """Turn the recorded ``output`` push URL into the git endpoint to use."""
+        return recorded_push_url
+
+    def clone_source(self, git_endpoint, analysis_dataset_id):
+        """Return what ``datalad clone`` should be given to obtain the results."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # names/commands baked into generated code
+    # ------------------------------------------------------------------
+    @property
+    def job_content_push_comment(self):
+        """Source comment above the content push in ``participant_job.sh``."""
+        raise NotImplementedError
+
+    @property
+    def job_content_push_echo(self):
+        """The ``echo`` line preceding the content push in ``participant_job.sh``."""
+        raise NotImplementedError
+
+    @property
+    def job_content_push_command(self):
+        """The shell command that publishes annexed content from a job."""
+        raise NotImplementedError
+
+    @property
+    def job_content_push_block(self):
+        """The whole content-publication stanza of ``participant_job.sh``.
+
+        This is phase one of the two-phase publication: content first, then
+        the result branch pushed last under ``flock`` as the marker that the
+        job finished. It must not push any ref.
+        """
+        return (
+            f'{self.job_content_push_comment}\n'
+            f"echo '{self.job_content_push_echo}'\n"
+            f'{self.job_content_push_command}'
+        )
+
+    @property
+    def merge_content_remote(self):
+        """Name of the git-annex remote holding content, as seen from ``merge_ds``."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # persistence
+    # ------------------------------------------------------------------
+    def to_config(self):
+        """Return the ``output_remote`` mapping for ``babs_proj_config.yaml``.
+
+        ``None`` means "do not record anything", which keeps the default
+        project config identical to what BABS wrote before this feature and
+        makes "key absent" unambiguously mean "the RIA default".
+        """
+        return
+
+
+class RiaOutputRemote(OutputRemote):
+    """The default: an output RIA store inside the BABS project root."""
+
+    type = 'ria'
+
+    def __init__(self, store_path):
+        self.store_path = str(store_path)
+        super().__init__('ria+file://' + self.store_path)
+
+    def create_sibling(self, dataset, sibling_kwargs):
+        dataset.create_sibling_ria(
+            name=GIT_SIBLING_NAME,
+            url=self.url,
+            new_store_ok=True,
+            **sibling_kwargs,
+        )
+
+    def resolve_git_endpoint(self, recorded_push_url):
+        # If the recorded URL points at the RIA store root rather than at the
+        # dataset directory (no `.git` there), resolve it through the
+        # `alias/data` symlink, e.g. output_ria/alias/data -> XX/xxx-uuid.
+        if not op.exists(op.join(recorded_push_url, '.git')):
+            alias_link = op.join(self.store_path, 'alias', 'data')
+            if op.exists(alias_link) and os.path.islink(alias_link):
+                return op.realpath(alias_link)
+        return recorded_push_url
+
+    def finalize(self, git_endpoint):
+        """Add the ``alias/data`` symlink into the output RIA store."""
+        print("Adding an alias 'data' to output RIA store...")
+        alias_dir = op.join(self.store_path, 'alias')
+        if not op.exists(alias_dir):
+            os.makedirs(alias_dir)
+        the_symlink = op.join(alias_dir, 'data')
+        if op.exists(the_symlink) & op.islink(the_symlink):
+            # exists and is a symlink: remove first
+            os.remove(the_symlink)
+        os.symlink(git_endpoint, the_symlink)
+
+    def clone_source(self, git_endpoint, analysis_dataset_id):
+        return self.url + '#' + analysis_dataset_id
+
+    @property
+    def job_content_push_comment(self):
+        return RIA_CONTENT_PUSH_COMMENT
+
+    @property
+    def job_content_push_echo(self):
+        return RIA_CONTENT_PUSH_ECHO
+
+    @property
+    def job_content_push_command(self):
+        return RIA_CONTENT_PUSH_COMMAND
+
+    @property
+    def merge_content_remote(self):
+        return RIA_CONTENT_SIBLING
+
+
+class BareGitOutputRemote(OutputRemote):
+    """A plain bare git repository that carries *both* publication channels.
+
+    The same URL that receives the result branches also stores the annexed
+    zip files, which is what makes this usable when the receiver is not the
+    controller's own filesystem: there is no second, separately addressed
+    content store whose URL could be recorded as a path that only the
+    controller can reach.
+    """
+
+    type = 'bare-git'
+
+    def __init__(self, url):
+        super().__init__(url)
+        if '://' in self.url or self.url.startswith('git@'):
+            raise ValueError(
+                f"'--output-remote {self.url}' is not a local path. BABS can only "
+                'guarantee that a bare repository is git-annex-initialized (and so '
+                'able to receive result *content*) when it can reach it as a local '
+                'path. Please pass a filesystem path.'
+            )
+        self.repo_path = op.abspath(op.expanduser(self.url))
+        self.url = self.repo_path
+
+    # ---------------- `babs init` ----------------
+    def create_sibling(self, dataset, sibling_kwargs):
+        shared = sibling_kwargs.get('shared')
+        self._ensure_bare_repo(shared)
+        self._ensure_annex()
+        dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
+
+    def _ensure_bare_repo(self, shared=None):
+        """Create the bare repository if needed; validate it if it exists."""
+        if op.exists(self.repo_path):
+            if not self._is_bare_repo():
+                raise ValueError(
+                    f"'--output-remote {self.repo_path}' exists but is not a bare git "
+                    'repository. Please point `--output-remote` at a bare repository '
+                    '(`git init --bare`) or at a path that does not exist yet.'
+                )
+            return
+        os.makedirs(op.dirname(self.repo_path), exist_ok=True)
+        cmd = ['git', 'init', '--bare']
+        if shared:
+            cmd.append(f'--shared={shared}')
+        cmd.append(self.repo_path)
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    def _is_bare_repo(self):
+        proc = subprocess.run(
+            ['git', 'rev-parse', '--is-bare-repository'],
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == 'true'
+
+    def annex_uuid(self):
+        """Return the repository's ``annex.uuid``, or ``''`` if it has none."""
+        proc = subprocess.run(
+            ['git', 'config', '--get', 'annex.uuid'],
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ''
+
+    def _ensure_annex(self):
+        """Make the bare repository a git-annex repository.
+
+        Without this, the repository has no ``annex.uuid``; git-annex then
+        treats it as a git-only remote and *silently* transfers no content
+        (``datalad push`` reports ``copy (notneeded)``), so every job would
+        publish a result branch whose zip file is nowhere.
+        """
+        if self.annex_uuid():
+            return
+        subprocess.run(
+            ['git', 'annex', 'init', 'babs-output'],
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if not self.annex_uuid():
+            raise RuntimeError(
+                f"`git annex init` in '{self.repo_path}' did not set annex.uuid; "
+                'this bare repository cannot receive result content.'
+            )
+
+    # ---------------- addressing ----------------
+    def clone_source(self, git_endpoint, analysis_dataset_id):
+        return git_endpoint
+
+    # ---------------- generated code ----------------
+    @property
+    def job_content_push_comment(self):
+        return '# push result file content to the output remote:'
+
+    @property
+    def job_content_push_echo(self):
+        return '# Push result file content to the output remote:'
+
+    @property
+    def job_content_push_command(self):
+        # Content only: the result branch is pushed separately, and last, so
+        # that a visible result branch always implies retrievable content.
+        # `--in here` restricts the transfer to content this job actually has.
+        return f'git annex copy --to {JOB_GIT_REMOTE_NAME} --in here .'
+
+    @property
+    def merge_content_remote(self):
+        # `merge_ds` is a plain clone of the bare repository, so the remote
+        # that holds the content is `origin` itself.
+        return 'origin'
+
+    def to_config(self):
+        return {'type': self.type, 'url': self.repo_path}
+
+
+def make_output_remote(output_ria_path, output_remote=None):
+    """Build the output remote provider for a BABS project.
+
+    Parameters
+    ----------
+    output_ria_path : str
+        Path of the in-project output RIA store (used by the default).
+    output_remote : str or None
+        Value of ``babs init --output-remote``.  ``None`` selects the default
+        RIA behaviour.
+    """
+    if output_remote is None:
+        return RiaOutputRemote(output_ria_path)
+    return BareGitOutputRemote(output_remote)
+
+
+def output_remote_from_config(output_ria_path, config_section):
+    """Rebuild the provider from ``babs_proj_config.yaml``.
+
+    A project created before ``--output-remote`` existed has no
+    ``output_remote`` section; that is the RIA default.
+    """
+    if not config_section:
+        return RiaOutputRemote(output_ria_path)
+    if not isinstance(config_section, dict):
+        raise TypeError(
+            f"'output_remote' in babs_proj_config.yaml must be a mapping, "
+            f'got {type(config_section).__name__}'
+        )
+    remote_type = config_section.get('type', RiaOutputRemote.type)
+    if remote_type == RiaOutputRemote.type:
+        return RiaOutputRemote(output_ria_path)
+    if remote_type == BareGitOutputRemote.type:
+        url = config_section.get('url')
+        if not url:
+            raise ValueError(
+                "'output_remote' of type 'bare-git' in babs_proj_config.yaml is missing its 'url'."
+            )
+        return BareGitOutputRemote(url)
+    raise ValueError(
+        f"Unknown 'output_remote.type' in babs_proj_config.yaml: {remote_type!r}. "
+        f"Known types: '{RiaOutputRemote.type}', '{BareGitOutputRemote.type}'."
+    )

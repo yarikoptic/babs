@@ -2,11 +2,13 @@
 
 import os
 import os.path as op
+import subprocess
 import time
 from urllib.parse import urlparse
 
 from babs.base import BABS
 from babs.constants import CHECK_MARK
+from babs.git_endpoint import endpoint_head_hash
 from babs.scheduler import (
     request_all_job_status,
     submit_one_test_job,
@@ -14,6 +16,7 @@ from babs.scheduler import (
 from babs.utils import (
     compare_repo_commit_hashes,
     get_immediate_subdirectories,
+    get_repo_hash,
     print_versions_from_yaml,
     read_yaml,
 )
@@ -181,6 +184,12 @@ class BABSCheckSetup(BABS):
         # Check input and output RIA: ----------------------
         print('\nChecking input and output RIA...')
 
+        if self.output_remote.type != 'ria':
+            self._check_non_ria_output_remote()
+            print(CHECK_MARK + ' All good!')
+            self._finish_check_setup(submit_a_test_job)
+            return
+
         # check if they are siblings of `analysis`:
         actual_output_ria_data_dir = urlparse(
             os.readlink(op.join(self.output_ria_path, 'alias/data'))
@@ -249,6 +258,83 @@ class BABSCheckSetup(BABS):
         print(CHECK_MARK + ' All good!')
 
         # Submit a test job (if requested) --------------------------------
+        self._finish_check_setup(submit_a_test_job)
+
+    def _check_non_ria_output_remote(self):
+        """Validate the input RIA and a non-RIA output remote.
+
+        The RIA branch reads both stores as local directories. A non-RIA
+        output remote is addressed by URL, so it is validated with
+        git-protocol calls instead; the input RIA is still local, and its
+        dataset directory is read off the `input` sibling rather than being
+        derived from the output store's `alias/data` symlink.
+        """
+        # input RIA: the `input` sibling's push URL is its dataset directory.
+        proc_input_ria_data_dir = subprocess.run(
+            [
+                'git',
+                '--git-dir',
+                op.join(self.analysis_path, '.git'),
+                'remote',
+                'get-url',
+                '--push',
+                'input',
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        actual_input_ria_data_dir = proc_input_ria_data_dir.stdout.strip()
+        if not op.exists(actual_input_ria_data_dir):
+            raise FileNotFoundError(
+                'The input RIA data directory does not exist: ' + actual_input_ria_data_dir
+            )
+
+        print("\tDatalad dataset `analysis`'s siblings:")
+        analysis_siblings = self.analysis_datalad_handle.siblings(action='query')
+        sibling_names = {sibling['name'] for sibling in analysis_siblings}
+        for required in ('input', 'output'):
+            if required not in sibling_names:
+                raise ValueError(
+                    "Did not find a sibling of 'analysis' DataLad dataset"
+                    f" that's called '{required}'. There may be something wrong when"
+                    ' setting up the input/output remotes!'
+                )
+
+        compare_repo_commit_hashes(
+            self.analysis_path,
+            actual_input_ria_data_dir,
+            'analysis',
+            'input RIA',
+        )
+
+        # output remote: reachable over the git protocol, and in sync.
+        # `endpoint_head_hash` raises (rather than reporting "empty") when the
+        # endpoint cannot be reached.
+        output_hash = endpoint_head_hash(self.output_git_url)
+        analysis_hash = get_repo_hash(self.analysis_path)
+        if output_hash != analysis_hash:
+            raise ValueError(
+                'The hash of current commit of `analysis` datalad dataset does not match'
+                f' with that of the output remote at {self.output_git_url}.'
+                f' analysis = {analysis_hash}; output remote = {output_hash}.'
+                ' It might be because that latest commits in analysis were not pushed.'
+                f" Try running this command in directory '{self.analysis_path}': \n"
+                '$ datalad push --to output'
+            )
+
+        # The content channel: a plain bare repository can only receive annexed
+        # result content if it is itself a git-annex repository.
+        annex_uuid = getattr(self.output_remote, 'annex_uuid', None)
+        if annex_uuid is not None and not annex_uuid():
+            raise RuntimeError(
+                f'The output remote {self.output_git_url} has no `annex.uuid`, so it'
+                ' cannot receive result *content* (git-annex would silently transfer'
+                ' nothing). Run `git annex init` in that repository.'
+            )
+
+    def _finish_check_setup(self, submit_a_test_job):
+        """Print the closing advice, or submit a test job."""
         if not submit_a_test_job:
             print(
                 '\n'

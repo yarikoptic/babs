@@ -6,6 +6,7 @@ from importlib import resources
 import yaml
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
+from babs.output_remote import RiaOutputRemote
 from babs.utils import container_image_path, var_safe_name
 
 # Multiple scheduler system handling
@@ -32,6 +33,7 @@ def generate_submit_script(
     container_images=None,
     datalad_run_message=None,
     analysis_path=None,
+    output_remote=None,
 ):
     """
     Generate a bash script that runs the BIDS App singularity image.
@@ -63,6 +65,10 @@ def generate_submit_script(
     analysis_path : str
         Absolute path to the analysis directory. Used in the generated script
         to locate shared container images.
+    output_remote : babs.output_remote.OutputRemote, optional
+        Where the job publishes its results. Determines the command used for
+        the *content* half of the two-phase publication. Defaults to the
+        output RIA storage sibling.
 
     Returns
     -------
@@ -133,6 +139,11 @@ def generate_submit_script(
         container_image_paths=container_image_paths,
         datalad_run_message=datalad_run_message,
         analysis_path=analysis_path,
+        content_push_block=(
+            RiaOutputRemote('').job_content_push_block
+            if output_remote is None
+            else output_remote.job_content_push_block
+        ),
     )
 
 

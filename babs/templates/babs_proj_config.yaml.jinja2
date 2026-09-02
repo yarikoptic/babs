@@ -19,4 +19,10 @@ container:
 container_images:
 {% for image_path in container_images %}
   - '{{ image_path }}'
-{% endfor %}
+{% endfor %}{% if output_remote %}
+
+# where job results are published; absent means the in-project output RIA store
+output_remote:
+  type: '{{ output_remote['type'] }}'
+  url: '{{ output_remote['url'] }}'
+{% endif %}
