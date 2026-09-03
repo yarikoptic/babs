@@ -34,14 +34,21 @@ class GitEndpointError(RuntimeError):
     """
 
 
-def _run_git(args, what, timeout=DEFAULT_TIMEOUT):
-    """Run a git command, raising :class:`GitEndpointError` on any failure."""
+def _run_git(args, what, timeout=DEFAULT_TIMEOUT, cwd=None):
+    """Run a git command, raising :class:`GitEndpointError` on any failure.
+
+    ``cwd`` matters for one command in particular: ``git push`` refuses to run
+    outside a repository even when the destination is an explicit URL, while
+    ``git ls-remote`` does not care. Leaving it unset makes the caller's shell
+    working directory load-bearing.
+    """
     try:
         proc = subprocess.run(
             args,
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=cwd,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -146,7 +153,7 @@ def endpoint_exists(url, timeout=DEFAULT_TIMEOUT):
     return True
 
 
-def delete_result_branches(url, branch_oids, timeout=DEFAULT_TIMEOUT):
+def delete_result_branches(url, branch_oids, timeout=DEFAULT_TIMEOUT, cwd=None):
     """Delete branches at a git endpoint, guarded by an expected-OID lease.
 
     Each branch is only deleted if the endpoint still has it at exactly the
@@ -187,4 +194,4 @@ def delete_result_branches(url, branch_oids, timeout=DEFAULT_TIMEOUT):
         args.append(f'--force-with-lease={_HEADS_PREFIX}{name}:{oid}')
     args.append(str(url))
     args.extend(f'{_HEADS_PREFIX}{name}' for name in branch_oids)
-    return _run_git(args, f"deleting merged branches at '{url}'", timeout=timeout)
+    return _run_git(args, f"deleting merged branches at '{url}'", timeout=timeout, cwd=cwd)

@@ -141,3 +141,34 @@ class TestLeaseSafeDeletion:
     def test_unreachable_endpoint_raises(self, tmp_path):
         with pytest.raises(GitEndpointError):
             delete_result_branches(str(tmp_path / 'gone.git'), {'job-1': 'a' * 40})
+
+
+def test_delete_runs_from_a_repository_not_the_ambient_cwd(tmp_path, monkeypatch):
+    """`git push` refuses to run outside a repository, even to an explicit URL.
+
+    Regression: the delete ran with no `cwd`, so it inherited the user's shell
+    working directory. `cd ~ && babs merge <project>` -- the ordinary case on a
+    cluster, where $HOME is not a git repo -- merged and pushed successfully,
+    then died with "fatal: not a git repository" and left every result branch
+    behind, for the RIA default as well as for a plain bare remote.
+    """
+    bare = tmp_path / 'store.git'
+    subprocess.run(['git', 'init', '--bare', '-q', '-b', 'main', str(bare)], check=True)
+    work = tmp_path / 'work'
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(work)], check=True)
+    for k, v in (('user.email', 't@e.st'), ('user.name', 'T')):
+        subprocess.run(['git', 'config', k, v], cwd=work, check=True)
+    (work / 'f.txt').write_text('x')
+    subprocess.run(['git', 'add', 'f.txt'], cwd=work, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'init'], cwd=work, check=True)
+    subprocess.run(['git', 'push', '-q', str(bare), 'main:job-1'], cwd=work, check=True)
+
+    oids = list_result_branches(str(bare))
+    assert 'job-1' in oids
+
+    not_a_repo = tmp_path / 'elsewhere'
+    not_a_repo.mkdir()
+    monkeypatch.chdir(not_a_repo)
+
+    delete_result_branches(str(bare), {'job-1': oids['job-1']}, cwd=str(work))
+    assert list_result_branches(str(bare)) == {}

@@ -71,6 +71,17 @@ def _is_local_path(url):
     return op.isabs(url)
 
 
+#: git-annex's own branch, which `git annex init` creates. It is never the
+#: branch a reader of the results wants HEAD to point at.
+_ANNEX_BRANCH = 'refs/heads/git-annex'
+
+
+def _run_git_ok(args):
+    """Run git, returning stripped stdout, or '' on any failure."""
+    proc = subprocess.run(args, capture_output=True, text=True, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ''
+
+
 class OutputRemote:
     """Base class: the place a BABS project publishes job results to."""
 
@@ -218,7 +229,7 @@ class BareGitOutputRemote(OutputRemote):
     # ---------------- `babs init` ----------------
     def create_sibling(self, dataset, sibling_kwargs):
         shared = sibling_kwargs.get('shared')
-        self._ensure_bare_repo(shared)
+        self._ensure_bare_repo(shared, sibling_kwargs.get('group'))
         self._ensure_annex()
         dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
         # Be explicit rather than trusting git-annex's probe: were it ever to
@@ -230,7 +241,7 @@ class BareGitOutputRemote(OutputRemote):
             check=True,
         )
 
-    def _ensure_bare_repo(self, shared=None):
+    def _ensure_bare_repo(self, shared=None, group=None):
         """Create the bare repository if needed; validate it if it exists."""
         if op.exists(self.repo_path):
             if self._is_bare_repo():
@@ -252,12 +263,24 @@ class BareGitOutputRemote(OutputRemote):
             cmd.append(f'--shared={shared}')
         cmd.append(self.repo_path)
         subprocess.run(cmd, capture_output=True, text=True, check=True)
-        if shared and shared != 'group':
-            # `--shared=<group-name>` sets the permission bits; the group
-            # ownership itself still has to be applied, as create_sibling_ria
-            # does for a RIA store. Without it a second member's job cannot
+        if group:
+            # `--shared=group` only sets the permission bits; the tree is still
+            # owned by the creating user's *primary* group, and the setgid bit
+            # then propagates that wrong group to everything git-annex writes
+            # under annex/objects/. create_sibling_ria applies the group for a
+            # RIA store; do the same here, or a second member's job cannot
             # write its results.
-            subprocess.run(['chgrp', '-R', shared, self.repo_path], check=False)
+            proc = subprocess.run(
+                ['chgrp', '-R', group, self.repo_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise ValueError(
+                    f"Could not set group '{group}' on the output remote "
+                    f"'{self.repo_path}': {proc.stderr.strip()}"
+                )
 
     def _is_bare_repo(self):
         proc = subprocess.run(
@@ -304,6 +327,35 @@ class BareGitOutputRemote(OutputRemote):
             )
 
     # ---------------- addressing ----------------
+    def finalize(self, git_endpoint):
+        """Point the bare repository's ``HEAD`` at the branch BABS publishes.
+
+        ``git init --bare`` takes ``HEAD`` from the creating machine's
+        ``init.defaultBranch``, and pushing a differently named branch does not
+        update it -- nor does BABS create the repository at all when the user
+        points ``--output-remote`` at a pre-existing one. A dangling ``HEAD``
+        then makes ``git ls-remote <url> HEAD`` return nothing (with exit 0),
+        so ``babs check-setup`` reports the endpoint as empty when it is fully
+        populated, and ``git remote show`` reports ``HEAD branch: (unknown)``,
+        which stops ``babs merge`` outright.
+        """
+        head = _run_git_ok(['git', '-C', self.repo_path, 'symbolic-ref', '--quiet', 'HEAD'])
+        if head and _run_git_ok(
+            ['git', '-C', self.repo_path, 'rev-parse', '--verify', '--quiet', head]
+        ):
+            return  # HEAD already resolves; leave it alone
+        for ref in _run_git_ok(
+            ['git', '-C', self.repo_path, 'for-each-ref', '--format=%(refname)', 'refs/heads/']
+        ).splitlines():
+            if ref != f'{_ANNEX_BRANCH}' and ref.strip():
+                subprocess.run(
+                    ['git', '-C', self.repo_path, 'symbolic-ref', 'HEAD', ref.strip()],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                return
+
     def clone_source(self, git_endpoint, analysis_dataset_id):
         return git_endpoint
 

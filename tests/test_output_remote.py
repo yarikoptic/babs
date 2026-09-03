@@ -294,3 +294,74 @@ class TestProvisioningGuards:
         while every job pushes over ssh to a host that was never annex-inited."""
         with pytest.raises(ValueError, match='local path'):
             BareGitOutputRemote(url)
+
+
+class TestSharedGroupAndHead:
+    """Two things `babs init` must get right on the receiving repository."""
+
+    def test_shared_group_applies_the_group_name(self, tmp_path, monkeypatch):
+        """Regression: the group *name* was dropped.
+
+        bootstrap always passes {'shared': 'group', 'group': <name>}, so a
+        guard of `shared != 'group'` was never true and chgrp never ran. The
+        repo got g+rws but the creating user's primary group, and the setgid
+        bit propagated that wrong group to everything git-annex later wrote
+        under annex/objects/ -- so a second member's job could not push.
+        """
+        seen = []
+        real = subprocess.run
+
+        def spy(argv, *a, **k):
+            if argv and argv[0] == 'chgrp':
+                seen.append(argv)
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            return real(argv, *a, **k)
+
+        monkeypatch.setattr(subprocess, 'run', spy)
+        remote = BareGitOutputRemote(str(tmp_path / 'out.git'))
+        remote._ensure_bare_repo('group', 'mylab')
+        assert seen == [['chgrp', '-R', 'mylab', str(tmp_path / 'out.git')]]
+
+    def test_finalize_points_head_at_the_published_branch(self, tmp_path):
+        """A pre-existing bare repo's HEAD may name a branch BABS never pushes.
+
+        `git push` does not re-point a bare repo's HEAD, so `ls-remote <url>
+        HEAD` returns nothing *with exit 0*: check-setup then calls a fully
+        populated endpoint empty, and `git remote show` reports `HEAD branch:
+        (unknown)`, which stops `babs merge`.
+        """
+        bare = tmp_path / 'out.git'
+        # created under `master`, as an older or differently-configured host would
+        _git('init', '--bare', '-q', '-b', 'master', str(bare))
+        work = tmp_path / 'work'
+        _git('init', '-q', '-b', 'main', str(work))
+        for k, v in (('user.email', 't@e.st'), ('user.name', 'T')):
+            _git('config', k, v, cwd=work)
+        (work / 'f.txt').write_text('x')
+        _git('add', 'f.txt', cwd=work)
+        _git('commit', '-qm', 'init', cwd=work)
+        _git('push', '-q', str(bare), 'main', cwd=work)
+
+        assert _git('ls-remote', str(bare), 'HEAD') == ''  # dangling
+
+        BareGitOutputRemote(str(bare)).finalize(str(bare))
+
+        assert _git('ls-remote', str(bare), 'HEAD').split()[0] == _git(
+            'rev-parse', 'main', cwd=work
+        )
+
+    def test_finalize_leaves_a_resolving_head_alone(self, tmp_path):
+        bare = tmp_path / 'out.git'
+        _git('init', '--bare', '-q', '-b', 'main', str(bare))
+        work = tmp_path / 'work'
+        _git('init', '-q', '-b', 'main', str(work))
+        for k, v in (('user.email', 't@e.st'), ('user.name', 'T')):
+            _git('config', k, v, cwd=work)
+        (work / 'f.txt').write_text('x')
+        _git('add', 'f.txt', cwd=work)
+        _git('commit', '-qm', 'init', cwd=work)
+        _git('push', '-q', str(bare), 'main', cwd=work)
+        _git('push', '-q', str(bare), 'main:other', cwd=work)
+
+        BareGitOutputRemote(str(bare)).finalize(str(bare))
+        assert _git('-C', str(bare), 'symbolic-ref', 'HEAD') == 'refs/heads/main'

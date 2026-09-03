@@ -398,5 +398,10 @@ class BABSMerge(BABS):
                 delete_result_branches(
                     self.output_git_url,
                     {branch: merged_branch_oids[branch] for branch in chunk},
+                    # `git push` needs a repository to run from, even when the
+                    # destination is an explicit URL. Without this it inherits
+                    # the user's shell cwd -- and fails outright when that is
+                    # not a git repository, which `cd ~ && babs merge …` is.
+                    cwd=self.analysis_path,
                 )
             )
