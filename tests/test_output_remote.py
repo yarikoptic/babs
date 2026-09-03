@@ -365,3 +365,41 @@ class TestSharedGroupAndHead:
 
         BareGitOutputRemote(str(bare)).finalize(str(bare))
         assert _git('-C', str(bare), 'symbolic-ref', 'HEAD') == 'refs/heads/main'
+
+
+class TestRejectedUrlsExplainTheRule:
+    """Each rejection should name the rule it broke, not a generic message."""
+
+    @pytest.mark.parametrize(
+        ('url', 'because'),
+        [
+            ('/srv/a b/out.git', 'whitespace'),
+            ('out.git', 'relative path'),
+            ('ssh://host/out.git', 'is a URL'),
+            ('git@host:out.git', 'scp-style'),
+            ('', 'empty'),
+        ],
+    )
+    def test_message_names_the_rule(self, url, because):
+        with pytest.raises(ValueError, match=because):
+            BareGitOutputRemote(url)
+
+    def test_whitespace_is_refused_before_it_can_break_every_job(self):
+        """The submit template embeds the push URL unquoted and the scheduler
+        splits the command on whitespace, so a path with a space becomes two
+        argv entries: the job reads its subject list from the tail of the path
+        and aborts. `babs init` and `check-setup` both pass first."""
+        with pytest.raises(ValueError, match='whitespace'):
+            BareGitOutputRemote('/srv/with space/out.git')
+
+    def test_tilde_is_expanded_not_rejected(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        assert BareGitOutputRemote('~/out.git').url == str(tmp_path / 'out.git')
+
+    def test_an_existing_plain_file_is_refused_clearly(self, tmp_path):
+        """Regression: os.listdir on a file raised NotADirectoryError, so the
+        user got a traceback instead of the validated message."""
+        target = tmp_path / 'notes.txt'
+        target.write_text('data')
+        with pytest.raises(ValueError, match='is a file, not a directory'):
+            BareGitOutputRemote(str(target))._ensure_bare_repo()

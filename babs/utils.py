@@ -402,42 +402,11 @@ def get_git_show_ref_shasum(branch_name, the_path):
     return git_ref, msg
 
 
-def get_results_branches(ria_directory):
-    """
-    Get branch list from git repository.
-
-    If no branches are found, an empty list is returned.
-
-    Parameters:
-    --------------
-    ria_directory: str
-        path to the git (or datalad) repository
-
-    """
-    branch_output = subprocess.run(
-        ['git', 'branch', '--list'],
-        cwd=ria_directory,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    # Filter to just branches starting with 'job-'
-    branches = [
-        # Remove leading and trailing asterisks and spaces
-        b.strip().replace('* ', '')
-        for b in branch_output.stdout.strip().split('\n')
-        if b.strip().replace('* ', '').startswith('job-')
-    ]
-
-    return branches
-
-
 def get_results_branches_from_clone(clone_path):
     """
     Get job branch names from a clone using remote refs (git branch -r).
 
-    Use this instead of get_results_branches(ria_directory) when you have
+    Use this instead of listing local branches when you have
     a clone of the output RIA (e.g. merge_ds). Listing branches in the RIA
     store can hang in CI; listing from the clone is fast and reliable.
 
@@ -470,7 +439,7 @@ def get_results_branches_from_ria(ria_data_dir, timeout=DEFAULT_GIT_ENDPOINT_TIM
     """
     List job-* branches in the output remote via git ls-remote.
 
-    Unlike get_results_branches(ria_directory) this takes a URL as readily as
+    This takes a URL as readily as
     a path and does not change directory, so it also works when the output
     remote is not a directory on this machine.
 
