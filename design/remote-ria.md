@@ -616,14 +616,24 @@ whose path keeps the `#`, and `RI('ria+file:///srv/store#123-abc')` reports
 resolve through `.localpath` (the scheme is not `file`), so the RIA branch
 either strips the `ria+` prefix or goes through `verify_ria_url()`.
 
-Caveat to record rather than gloss: `datalad.support.network` is not part of
-datalad's documented public API (no `__all__`, not reachable through
-`datalad.api`), so this pins BABS to an internal. The risk looks small —
-datalad uses it throughout its own core (`ora_remote`, `create_sibling_ria`,
-`ria_utils`, `sshconnector`, the downloaders), datalad is already a hard
-dependency, and `babs/utils.py:52` already imports
-`datalad.distribution.dataset.Dataset` — but it belongs in a single thin
-adapter module so there is one import site to fix if it ever moves.
+`datalad.support.network` carries no `__all__` today, but datalad's maintainer
+has confirmed it is intended as a public interface and will mark it as such, so
+this is not a bet on an internal. (`datalad.api` is the wrong home for it
+regardless: its 48 entries are 46 command functions, the `datalad` module, and
+`Dataset` as the entry point *into* the command surface — `RI` is neither a
+command nor a route to one, and a flat `datalad.api.URL` would be ambiguous at
+every call site.)
+
+One dependency to keep in view: the RIA branch wants
+`datalad.customremotes.ria_utils.verify_ria_url()`, and `customremotes` reads
+considerably more internal than `support`. If that one stays unmarked, BABS
+hand-rolls `ria+` parsing anyway — the duplication this whole exercise is
+trying to remove.
+
+A thin adapter module is still worth having, but for the other reason: it is
+the home for the checks that are BABS policy rather than URL semantics (empty
+value, whitespace the generated submission command would split,
+`expanduser`/`abspath`).
 
 **Credentials are the user's; BABS's obligation is not to interfere.** Ssh
 keys, kerberos and the like are site and user configuration, and no
