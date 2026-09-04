@@ -564,6 +564,90 @@ about git at all:
    case, where the filesystem permissions of the submitting user are the whole
    story.
 
+### Third round of review
+
+**Use datalad's `RI` instead of hand-rolled URL classification.**
+`datalad.support.network.RI` is a factory over resource identifiers with
+`URL`, `SSHRI` and `PathRI` specializations, and it classifies every case this
+implementation hand-rolled a rule for (measured, datalad 1.6.2):
+
+| value | `RI(...)` |
+|---|---|
+| `/srv/out.git`, `out.git`, `./out.git`, `~/out.git` | `PathRI` |
+| `file:///srv/out.git` | `URL`, scheme `file` |
+| `ssh://user@host:2222/srv/x` | `URL`, scheme `ssh`, with username and port |
+| `https://forge.org/u/r.git` | `URL`, scheme `https` |
+| `git@host:out.git`, `user@host:/srv/x`, `host:/srv/x` | `SSHRI` — the case `urlparse` gets wrong |
+| `ria+file:///srv/store`, `ria+ssh://host/srv/store` | `URL`, compound scheme preserved |
+
+`.localpath` is the primitive worth having: it yields the path for `PathRI` and
+for `file://` URLs and raises `ValueError` for anything else, which is the whole
+local/non-local question in one property. `str(ri)` round-trips, so the user's
+value can be stored and handed to git unchanged. The type maps directly onto
+the dispatch above: `PathRI` and `file://` are local; `ria+*` is a RIA store;
+`SSHRI` or `ssh://` is creatable with `datalad create-sibling`; `http(s)` is
+validate-only or a forge helper.
+
+For the RIA branch, `datalad.customremotes.ria_utils.verify_ria_url()` is worth
+reusing rather than re-deriving: it validates the `ria+` prefix, restricts the
+protocol to ssh/file/http(s), applies datalad's `rewrite_url()` config rewrites
+(which BABS does not honour today), and returns `(host, base_path,
+rewritten_url)` with `host=None` for `file` — a convention its own comment
+marks as load-bearing for ORA.
+
+Three things `RI` deliberately does not decide, so a thin BABS layer remains,
+reduced to policy rather than parsing: `RI('')` is an empty `PathRI`;
+`/srv/with space/out.git` is an accepted `PathRI`, while BABS must refuse
+whitespace because the generated submission command would split it into
+separate arguments; and `~`/relative paths are preserved literally, so
+`expanduser`/`abspath` stay ours — which is the one boundary where
+`pathlib.Path` belongs.
+
+BABS tells local from remote in three separate hand-rolled places today, and
+`RI` subsumes all of them: `output_remote._is_local_path()` (git's scp-style
+rule plus `op.isabs`), `base.source_to_local_path()` (prefix-stripping
+`ria+file://` / `file://` and splitting off a `#fragment`), and
+`check_setup.py:194`, which pushes a symlink target through
+`urlparse(...).path`. The middle one also has a latent bug that `RI` fixes for
+free: it splits on `#` unconditionally, so a local path that legitimately
+contains a `#` is truncated, whereas `RI('/srv/x#notafragment')` is a `PathRI`
+whose path keeps the `#`, and `RI('ria+file:///srv/store#123-abc')` reports
+`path='/srv/store'` with `fragment='123-abc'`. Note that `ria+file` does *not*
+resolve through `.localpath` (the scheme is not `file`), so the RIA branch
+either strips the `ria+` prefix or goes through `verify_ria_url()`.
+
+Caveat to record rather than gloss: `datalad.support.network` is not part of
+datalad's documented public API (no `__all__`, not reachable through
+`datalad.api`), so this pins BABS to an internal. The risk looks small —
+datalad uses it throughout its own core (`ora_remote`, `create_sibling_ria`,
+`ria_utils`, `sshconnector`, the downloaders), datalad is already a hard
+dependency, and `babs/utils.py:52` already imports
+`datalad.distribution.dataset.Dataset` — but it belongs in a single thin
+adapter module so there is one import site to fix if it ever moves.
+
+**Credentials are the user's; BABS's obligation is not to interfere.** Ssh
+keys, kerberos and the like are site and user configuration, and no
+`check-setup` probe on the submit host can meaningfully verify what a compute
+node will have. What BABS owes is to leave that configuration intact, to keep
+the door open for variables it may need to add later, and to document the
+prerequisite.
+
+It does not currently do the first part. `container.py:271` builds
+
+```python
+env_flags = '--export=DSLOCKFILE=' + babs.analysis_path + '/.SLURM_datalad_lock'
+```
+
+and Slurm documents `--export=<vars>` *without* `ALL` as propagating only the
+named variables plus the `SLURM_*` set. Every BABS job therefore starts with no
+`SSH_AUTH_SOCK`, no `KRB5CCNAME`, no site-set `GIT_SSH_COMMAND` and nothing a
+module load placed in the environment. `--export=ALL,DSLOCKFILE=…` keeps the
+submitting environment and still sets the variable BABS needs. This is
+pre-existing behaviour affecting every project, not only remote endpoints, and
+it is Slurm's documented semantics rather than something measured here — there
+is no Slurm in the development container to demonstrate it, so it needs a real
+check before the change lands.
+
 ## Testing
 
 - **Unit** — the endpoint helpers are pure git plumbing over a URL, tested
@@ -613,9 +697,10 @@ about git at all:
    or a warning is a policy call.
 6. **Ref-deletion refusal on a hosted endpoint** — see above; needs a decision
    on warn-and-leave vs. an alternative namespace that forges allow deleting.
-7. **Job-side credentials for a hosted endpoint.** Nothing in BABS puts
-   authentication on the compute nodes, and nothing checks for it at
-   `babs init`. A `check-setup` probe cannot answer it either, since it runs on
-   the submit host; the honest options are documenting the requirement and
-   failing the first job loudly, or submitting a one-task canary job that only
-   pushes an empty branch.
+7. **Non-interference with job-side credentials.** Authentication on the
+   compute nodes is the user's and the site's to arrange; BABS's part is to
+   leave it alone and document it. The open item is therefore the
+   `--export=ALL,DSLOCKFILE=…` change above -- which needs verifying on a real
+   Slurm cluster -- plus deciding whether a hosted endpoint warrants a one-task
+   canary job that only pushes an empty branch, rather than discovering the
+   problem across a whole array.
