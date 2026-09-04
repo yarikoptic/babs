@@ -460,3 +460,20 @@ class TestAnnexIgnoreIsReadNotForced:
             plain._clear_stale_annex_ignore(str(analysis))
         # and the flag git-annex set is left as it was
         assert self._ignore_value(analysis) == 'true'
+
+
+class TestContentRemoteNaming:
+    """The content sibling is named differently in each clone; check-setup and
+    merge each need the name for *their* context, not a single constant."""
+
+    def test_ria_uses_the_ora_name_everywhere(self, tmp_path):
+        remote = RiaOutputRemote(str(tmp_path / 'output_ria'))
+        assert remote.analysis_content_remote == 'output-storage'
+        assert remote.merge_content_remote == 'output-storage'
+
+    def test_bare_git_carries_content_on_the_ref_sibling(self, tmp_path):
+        remote = BareGitOutputRemote(str(tmp_path / 'out.git'))
+        # in `analysis` the single sibling is `output`; `merge_ds` is a clone
+        # of the repository itself, so there it is `origin`
+        assert remote.analysis_content_remote == 'output'
+        assert remote.merge_content_remote == 'origin'

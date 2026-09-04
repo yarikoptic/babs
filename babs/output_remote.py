@@ -162,6 +162,11 @@ class OutputRemote:
         """Name of the git-annex remote holding content, as seen from ``merge_ds``."""
         raise NotImplementedError
 
+    @property
+    def analysis_content_remote(self):
+        """Name of the git-annex remote holding content, as seen from ``analysis``."""
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # persistence
     # ------------------------------------------------------------------
@@ -227,6 +232,12 @@ class RiaOutputRemote(OutputRemote):
 
     @property
     def merge_content_remote(self):
+        return RIA_CONTENT_SIBLING
+
+    @property
+    def analysis_content_remote(self):
+        # The ORA remote is auto-enabled from the git-annex branch, so it
+        # carries the same name in every clone.
         return RIA_CONTENT_SIBLING
 
 
@@ -461,6 +472,12 @@ class BareGitOutputRemote(OutputRemote):
         # `merge_ds` is a plain clone of the bare repository, so the remote
         # that holds the content is `origin` itself.
         return 'origin'
+
+    @property
+    def analysis_content_remote(self):
+        # One sibling carries both channels here, so content lives on the
+        # same remote as the refs.
+        return GIT_SIBLING_NAME
 
     def to_config(self):
         return {'type': self.type, 'url': self.repo_path}

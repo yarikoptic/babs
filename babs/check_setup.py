@@ -187,6 +187,7 @@ class BABSCheckSetup(BABS):
         if self.output_remote.type != 'ria':
             self._check_non_ria_output_remote()
             print(CHECK_MARK + ' All good!')
+            self._check_content_channel()
             self._finish_check_setup(submit_a_test_job)
             return
 
@@ -257,8 +258,48 @@ class BABSCheckSetup(BABS):
         )
         print(CHECK_MARK + ' All good!')
 
+        self._check_content_channel()
+
         # Submit a test job (if requested) --------------------------------
         self._finish_check_setup(submit_a_test_job)
+
+    def _check_content_channel(self):
+        """Exercise the git-annex remote that result *content* has to reach.
+
+        `check-setup` otherwise only proves the *git* channel works: the
+        siblings exist and the hashes match. Results travel on two channels,
+        and the annex one has its own way of being broken -- a sibling name
+        that does not resolve, an `annex.uuid` git-annex cannot read, an
+        `annex-ignore` left over from a failed probe. `git annex fsck` reports
+        those, and running it here costs nothing: right after `babs init` the
+        analysis dataset has no results yet, so there is nothing to checksum.
+
+        What this does **not** prove, measured against git-annex 10.20240129:
+        once a `git-annex` branch has been pushed to the endpoint, `fsck`
+        returns 0 even for an endpoint whose `annex.uuid` is unset and which
+        therefore holds no content. The guarantee that content can actually
+        land stays where it is made -- the annex check when the sibling is
+        created -- and the guarantee that it *did* land belongs per job, after
+        the content push.
+        """
+        content_remote = self.output_remote.analysis_content_remote
+        print(f"\nChecking the content channel ('{content_remote}')...")
+        proc = subprocess.run(
+            ['git', 'annex', 'fsck', '--fast', '-f', content_remote],
+            cwd=self.analysis_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise ValueError(
+                f'`git annex fsck --fast -f {content_remote}` failed in '
+                f"'{self.analysis_path}':\n"
+                f'{(proc.stderr or proc.stdout).strip()}\n'
+                f"git-annex cannot use '{content_remote}' to store result content, so "
+                'jobs would publish result branches whose data is nowhere.'
+            )
+        print(CHECK_MARK + ' All good!')
 
     def _check_non_ria_output_remote(self):
         """Validate the input RIA and a non-RIA output remote.
