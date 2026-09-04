@@ -27,6 +27,7 @@ nothing.  :meth:`BareGitOutputRemote.create_sibling` guarantees this.
 import os
 import os.path as op
 import subprocess
+import warnings
 
 #: Name of the datalad sibling that receives the result *git refs*.
 GIT_SIBLING_NAME = 'output'
@@ -260,12 +261,57 @@ class BareGitOutputRemote(OutputRemote):
         self._ensure_bare_repo(shared, sibling_kwargs.get('group'))
         self._ensure_annex()
         dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
-        # Be explicit rather than trusting git-annex's probe: were it ever to
-        # fail transiently, the cached `annex-ignore=true` would turn every
-        # later content push into a silent no-op.
+        self._clear_stale_annex_ignore(dataset.path)
+
+    def _clear_stale_annex_ignore(self, dataset_path):
+        """Clear `annex-ignore` only when the endpoint provably *is* an annex.
+
+        git-annex sets ``remote.<name>.annex-ignore=true`` when its probe could
+        not determine the remote's ``annex.uuid``, and caches that so it stops
+        retrying. Two very different situations reach that flag:
+
+        * a stale probe against a repository BABS has just ``git annex init``-ed
+          -- clearing it is right; and
+        * a remote that genuinely has no annex -- where clearing it would
+          replace a condition git-annex correctly detected with the silent
+          failure this whole provider exists to avoid (``datalad push``
+          reporting ``copy (notneeded)``, zero objects, exit 0).
+
+        Setting it to ``false`` unconditionally cannot tell those apart, so the
+        flag is read first and only ever cleared against positive evidence of
+        an annex. The RIA default is the reminder that ``annex-ignore=true`` is
+        often entirely correct: its *git* sibling carries no content, which
+        goes to the ORA remote instead.
+        """
+        proc = subprocess.run(
+            ['git', 'config', '--type=bool', '--get', f'remote.{GIT_SIBLING_NAME}.annex-ignore'],
+            cwd=dataset_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 or proc.stdout.strip() != 'true':
+            return  # unset or already false: git-annex's own view is fine
+
+        # The positive check. For a local repository the annex uuid is
+        # authoritative; a URL endpoint would instead have to advertise a
+        # `git-annex` branch.
+        if not self.annex_uuid():
+            raise ValueError(
+                f"git-annex marked the output remote '{self.repo_path}' as annex-ignore, "
+                'and it has no annex.uuid -- so it cannot store result content, and every '
+                'job would publish a result branch whose data is nowhere. Run '
+                '`git annex init` in it, or point `--output-remote` elsewhere.'
+            )
+        warnings.warn(
+            f"remote.{GIT_SIBLING_NAME}.annex-ignore was set to 'true' for "
+            f"'{self.repo_path}', which is a git-annex repository -- git-annex's probe "
+            'must have failed transiently. Clearing it, so result content can be pushed.',
+            stacklevel=2,
+        )
         subprocess.run(
             ['git', 'config', f'remote.{GIT_SIBLING_NAME}.annex-ignore', 'false'],
-            cwd=dataset.path,
+            cwd=dataset_path,
             check=True,
         )
 

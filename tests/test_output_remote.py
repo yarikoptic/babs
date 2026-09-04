@@ -403,3 +403,60 @@ class TestRejectedUrlsExplainTheRule:
         target.write_text('data')
         with pytest.raises(ValueError, match='is a file, not a directory'):
             BareGitOutputRemote(str(target))._ensure_bare_repo()
+
+
+class TestAnnexIgnoreIsReadNotForced:
+    """`annex-ignore=true` means git-annex found no annex; that is often right.
+
+    The RIA default is the standing example: its *git* sibling carries no
+    content, so git-annex marks it ignored and content goes to the ORA remote.
+    Clearing the flag blindly turns a condition git-annex detected correctly
+    into a silent content-loss, so it is only ever cleared against evidence.
+    """
+
+    @staticmethod
+    def _analysis(tmp_path):
+        analysis = tmp_path / 'analysis'
+        analysis.mkdir()
+        _git('init', '-q', cwd=analysis)
+        return analysis
+
+    @staticmethod
+    def _annexed_remote(tmp_path):
+        remote = BareGitOutputRemote(str(tmp_path / 'out.git'))
+        remote._ensure_bare_repo()
+        remote._ensure_annex()
+        return remote
+
+    def _ignore_value(self, analysis):
+        return _git('config', '--get', 'remote.output.annex-ignore', cwd=analysis, check=False)
+
+    def test_unset_is_left_alone(self, tmp_path):
+        analysis = self._analysis(tmp_path)
+        self._annexed_remote(tmp_path)._clear_stale_annex_ignore(str(analysis))
+        assert self._ignore_value(analysis) == ''
+
+    def test_false_is_left_alone(self, tmp_path):
+        analysis = self._analysis(tmp_path)
+        _git('config', 'remote.output.annex-ignore', 'false', cwd=analysis)
+        self._annexed_remote(tmp_path)._clear_stale_annex_ignore(str(analysis))
+        assert self._ignore_value(analysis) == 'false'
+
+    def test_stale_true_on_a_real_annex_is_cleared_with_a_warning(self, tmp_path):
+        analysis = self._analysis(tmp_path)
+        _git('config', 'remote.output.annex-ignore', 'true', cwd=analysis)
+        remote = self._annexed_remote(tmp_path)
+        with pytest.warns(UserWarning, match='annex-ignore'):
+            remote._clear_stale_annex_ignore(str(analysis))
+        assert self._ignore_value(analysis) == 'false'
+
+    def test_true_without_an_annex_raises_instead_of_being_overridden(self, tmp_path):
+        """The case that must not be papered over: no annex means no content."""
+        analysis = self._analysis(tmp_path)
+        _git('config', 'remote.output.annex-ignore', 'true', cwd=analysis)
+        plain = BareGitOutputRemote(str(tmp_path / 'plain.git'))
+        plain._ensure_bare_repo()  # deliberately *not* annex-inited
+        with pytest.raises(ValueError, match='annex-ignore'):
+            plain._clear_stale_annex_ignore(str(analysis))
+        # and the flag git-annex set is left as it was
+        assert self._ignore_value(analysis) == 'true'
