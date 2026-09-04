@@ -485,6 +485,85 @@ cannot be anything else. Help text and docstrings that say "path" today are
 accurately describing the narrowing, and should be widened with the behaviour,
 not before it.
 
+### Second round of review
+
+**Creating a remote endpoint is possible for some transports.** The
+create-locally/validate-remotely split above is too coarse: `datalad
+create-sibling` creates *and* `git annex init`-s a repository over ssh, and
+datalad ships per-forge helpers (`create-sibling-gin`, `-gitea`, `-gogs`,
+`-gitlab`, `-github`). So the URL branch is really three-way — `ssh://`
+creatable with `create-sibling`; a known forge creatable with its helper (which
+needs credentials and host detection); anything else validate-only. Whether a
+forge can hold annex content is a property of the forge, not the protocol
+(forgejo-aneksajo and GIN can, plain Gitea and GitHub cannot), and the
+"advertises `refs/heads/git-annex`" probe answers that without BABS keeping a
+list. Out of scope for the first increment; recorded as the shape the URL
+branch grows into.
+
+**Verify that content arrived, per job, instead of inferring it at init.**
+Measured, against a bare repository that was never annex-inited:
+
+```
+$ datalad push --to plain
+action summary:
+  copy (notneeded: 1)
+  publish (ok: 2)          # refs published, content not, exit 0
+
+$ git annex find --in here --not --in plain
+f.txt                      # ← caught
+```
+
+After a successful `copy --to` against a properly annex-inited remote the same
+command prints nothing. Two details: it exits 0 either way, so the test is on
+*empty output*, not on the return code; and it reads the local location log,
+which the push has just written, so it is a real check rather than a tautology.
+
+This belongs in the job script, between the content push and the locked
+result-ref push: if content is missing the job must **not** publish its result
+branch, so it is counted as failed rather than silently producing an
+unretrievable result. `merge.py:331` already runs `git annex find --not --in
+<remote>` after merging; the job-time check is the missing one, and it is where
+the damage starts. It also changes the argument in the previous section: the
+init-time locality restriction exists because BABS cannot *infer* that a remote
+endpoint will accept content, and a per-job proof that content landed is
+strictly stronger than that inference. `datalad drop`/`remove` verifies
+numcopies before purging on the same principle.
+
+**Which provider a value selects should be detected, not spelled.** For an
+endpoint that already exists, `ria-layout-version` identifies a RIA store and
+`git rev-parse --is-bare-repository` separates a bare repository from one with
+a worktree. That is authoritative, and it protects a user who points at a real
+store whose directory name does not match any convention. A convention is only
+needed to decide what to *create* at a path that does not exist yet, and there
+the explicit form is better than sniffing a `.git` suffix off a bare path:
+`ria+file:///…` for a RIA store, `file:///….git` for a bare repository,
+`file:///…` for one with a worktree, a bare path keeping the RIA default.
+Back-compatibility does not constrain this choice: `--output-remote` is new,
+and a project that never passes it keeps its in-project `output_ria` untouched.
+
+One measured caveat on the relative form: **`file:///./` is not a git URL.**
+`git ls-remote "file://./bare.git"` fails with `'/bare.git' does not appear to
+be a git repository` — git parses the `.` as the *host* and drops it — and
+`file:///./bare.git` resolves to the absolute path `/./bare.git`. A relative
+form therefore has to be a BABS-level convention expanded before anything
+reaches git or datalad. That is fine (relative paths are already absolutized,
+since git would otherwise resolve them against `analysis/`), but it must be
+documented as a BABS convention rather than as URL syntax.
+
+**A hosted endpoint needs documented prerequisites**, and one of them is not
+about git at all:
+
+1. an annex-capable forge (forgejo-aneksajo, GIN);
+2. no branch protection on `job-*`;
+3. ref deletion permitted — or BABS configured to leave merged branches in
+   place (see the `--atomic` deletion note above);
+4. **credentials on the compute nodes.** Jobs run unattended on cluster nodes,
+   so pushing to a forge needs non-interactive authentication *there* — a
+   deploy key, or a token in a credential helper. This is as hard a
+   prerequisite as the annex one and has no counterpart in the local or RIA
+   case, where the filesystem permissions of the submitting user are the whole
+   story.
+
 ## Testing
 
 - **Unit** — the endpoint helpers are pure git plumbing over a URL, tested
@@ -534,3 +613,9 @@ not before it.
    or a warning is a policy call.
 6. **Ref-deletion refusal on a hosted endpoint** — see above; needs a decision
    on warn-and-leave vs. an alternative namespace that forges allow deleting.
+7. **Job-side credentials for a hosted endpoint.** Nothing in BABS puts
+   authentication on the compute nodes, and nothing checks for it at
+   `babs init`. A `check-setup` probe cannot answer it either, since it runs on
+   the submit host; the honest options are documenting the requirement and
+   failing the first job loudly, or submitting a one-task canary job that only
+   pushes an empty branch.
