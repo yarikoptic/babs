@@ -308,20 +308,210 @@ a real check being traded away.
 Steps 2 and 4 are correctness fixes for existing local-RIA projects,
 independent of remote support.
 
+## Implementation notes (verified while building it)
+
+The minimal increment above is implemented on this branch, with a plain bare
+git repository supported as an output remote (`babs init --output-remote`).
+The code is split the way the two channels are: `babs/git_endpoint.py` is pure
+git plumbing against a URL (no datalad, no filesystem assumptions), and
+`babs/output_remote.py` holds the two providers — `RiaOutputRemote` (the
+unchanged default) and `BareGitOutputRemote`. Everything below was **measured**
+against git-annex 10.20240129 / datalad 1.6.2, not reasoned from source.
+
+**Confirmed as designed.** `git remote get-url --push output` returns the
+dataset directory `<store>/<id[:3]>/<id[3:]>` (a bare path for `ria+file`, so
+the old truncation was a no-op locally); `remote.output.annex-ignore=true` on
+the RIA git sibling; and the ORA remote is recorded in the `git-annex` branch
+as `url=ria+file:///<project_root>/output_ria` with `autoenable=true` and no
+`push-url` — Finding 4, reproduced end to end.
+
+**A bare repo must be `git annex init`-ed, or content is silently lost.**
+Pushing to a bare repository that has not been annex-initialized reports
+`copy (notneeded)` and transfers **zero** annex objects while still pushing the
+branches. The run looks successful and the refs are there, but a fresh clone
+cannot `git annex get` the results. The same repository refuses loudly under
+`git annex copy --to` (`cannot determine uuid`, rc=1) — the silent path is the
+one the job script takes, which is why `BareGitOutputRemote.create_sibling()`
+initializes the repository and refuses to continue if no `annex.uuid` results.
+
+**The content sibling's name is context-dependent.** This was not in the design
+and is the one thing that made the first job fail (`Unknown push target
+'output'`). A RIA ORA remote is auto-enabled from the git-annex branch, so
+`output-storage` resolves in every clone — controller, job and `merge_ds`
+alike. A plain remote has no such record and is known only by whatever each
+clone calls it:
+
+| clone | RIA (ORA) | plain remote |
+|---|---|---|
+| `analysis` | `output-storage` | `output` |
+| participant job | `output-storage` | `outputstore` (added by the job script) |
+| `merge_ds` | `output-storage` | `origin` (it is cloned *from* the remote) |
+
+Hence the name is asked of the provider per context rather than being a single
+constant.
+
+**Content-only transfer preserves the two-phase publication.** For a plain
+remote `datalad push --to outputstore` would publish refs too, destroying the
+property that the result ref is the last, locked, completion marker. The job
+script uses `git annex copy --to outputstore .` instead — verified to move
+content while pushing no refs, after which the locked `git push outputstore
+$BRANCH` publishes the result. The RIA path still uses
+`datalad push --to output-storage`, unchanged.
+
+**`git push` needs a repository context, even with an explicit URL.**
+`git ls-remote <url>` works from anywhere; `git push <url> …` does not — it
+fails with *"fatal: not a git repository"*. Lease-safe deletion is therefore
+run with an explicit `cwd`. This one bit twice: unit tests pass without it
+because pytest runs inside a repository, and the e2e script passes because it
+`cd`s to the repository root, so the failure only appears as
+`cd ~ && babs merge <project>` — which merged, pushed, printed *"`babs merge`
+was successful!"*, then died, leaving every `job-*` branch in place. It affects
+the **RIA default**, not just the new provider.
+
+**A pre-existing bare repo's `HEAD` may be unborn.** `git init --bare` points
+`HEAD` at `init.defaultBranch`, and pushing a differently named branch does not
+update it; `git ls-remote <url> HEAD` then prints nothing *and exits 0*.
+Probing `HEAD` for reachability therefore reports a fully populated remote as
+missing, and `git remote show` reports no default branch, which stops
+`babs merge`. The reachability probe here is still `ls-remote <url> HEAD`, so
+the provider repairs `HEAD` instead: after the first push it points it at a
+published branch that is not `git-annex` (never what a reader of the results
+wants). That repair is a local `git symbolic-ref`, so a *pre-existing* endpoint
+reached only by URL would still be misreported as empty — a residual risk that
+becomes real exactly when URL endpoints are allowed, and the reason to prefer
+"does it advertise any ref" as the probe.
+
+**Classifying a git URL is not `urlparse`'s job.** `git@host:out.git` has no
+scheme and no `://`, so `urlparse` reports it as a bare path — which would make
+provisioning create a local directory literally named `git@host:out.git` while
+every job pushes over ssh to the real host, and that host never gets
+`git annex init`-ed. `user@host:/srv/x` and `host:/srv/x` have the same shape.
+The check applies git's own rule (no `://`, colon before the first slash). A
+relative path has the mirror problem: git resolves it against `analysis/`, not
+the directory `babs init` ran in, so the value is made absolute.
+
+**The deletion lease must use the OIDs from enumeration.** Re-reading the
+branch OIDs immediately before `git push --delete` pins whatever the branches
+point at by then, which makes the lease a no-op by construction. `babs merge`
+captures them where it lists the branches, and the push is `--atomic`, so a
+single refused lease cannot leave the rest of a chunk deleted with the caller
+unable to tell which.
+
+**What `--output-remote` refuses, and why one of those refusals is wrong.**
+A `ria+` URL must be refused: `output_ria_url` and `output_ria_path` stay
+pinned to the project's own store, so a foreign RIA store would be accepted at
+`babs init`, pass `check-setup`, run every job, and only fail at `babs merge` —
+after a full compute run. Failing at init is the honest behaviour until the RIA
+URL is plumbed through. Today that refusal is incidental: it falls out of the
+blanket rule that rejects anything that is not a local path, and it has to
+become an explicit check the moment URLs are accepted. That blanket rule also
+refuses every other **non-local** URL, which is a narrowing of this design
+rather than a property of it — see the next section.
+
+## Review of the implementation — what it changes here
+
+The implementation on this branch was reviewed by @yarikoptic
+([review](https://github.com/yarikoptic/babs/pull/2#pullrequestreview-5114526953)).
+Several points land on this design rather than on that code, so they are
+recorded here.
+
+**The endpoint taxonomy is four-way, not two-way.** This document framed the
+choice as "RIA store, or plain bare git repository". That is too narrow in two
+directions at once, and the review names both: an endpoint reachable only by
+URL (a forgejo+aneksjo instance — the literal ask of #401), and a *non-bare*
+local repository that receives pushes and updates its worktree. The dispatch
+should be on the shape of the value, with the URL/path split deciding
+create-vs-validate:
+
+| `--output-remote` value | BABS does |
+|---|---|
+| URL (`://`, or git's scp-style syntax) | never creates. Validates: reachable, and advertises `refs/heads/git-annex` |
+| local path ending in `.git` | creates/manages a plain bare repository |
+| local path not ending in `.git` | creates/manages a regular repository with a worktree, `receive.denyNonFastforwards=true` + `receive.denyCurrentBranch=updateInstead` |
+| local path that is (or should be) a RIA store | the RIA provider — still the default |
+
+**The narrowing to record.** The rule underneath that table — *create locally,
+validate remotely* — is the one this design intends, and BABS can only
+*guarantee* `git annex init` on an endpoint it can reach as a path. But that
+argument bounds creation only: an endpoint that already **is** an annex can be
+validated instead. `BareGitOutputRemote.__init__` currently raises on every
+non-local URL, so what this branch adds is a second **local** provider and
+#401's literal ask stays unmet. Restoring URL support is recovery of stated
+design, not new design work.
+
+**`receive.denyCurrentBranch=updateInstead` works, including for content.**
+Measured against a non-bare receiver carrying that config plus
+`denyNonFastforwards=true`: `git annex copy --to origin .` reports `ok` and the
+object lands in the receiver's `.git/annex/objects`; `git push origin
+HEAD:job-1` creates the branch; and a push into the receiver's *checked-out*
+branch is accepted, with the worktree updated. Two consequences for the docs:
+`updateInstead` refuses a push while the receiver's worktree is dirty, and
+since jobs only ever push `job-*` refs, the checkout advances only when
+`babs merge` pushes the main branch — the tree does not track individual jobs.
+
+**Ref deletion is a hosting-policy risk once the endpoint is a forge.** Step 4
+above replaces `git branch --delete` with
+`git push --atomic --delete --force-with-lease=<ref>:<oid>`. Forges commonly
+forbid ref deletion or non-fast-forward pushes, and `--atomic` means one
+refusal fails the whole batch. On a non-local endpoint this must degrade to a
+warning that leaves the merged branches in place; failing `babs merge` would
+make such a project permanently unmergeable.
+
+**`remote.<name>.annex-ignore` must be read, never forced.** The code currently
+sets it to `false` unconditionally after creating the sibling. git-annex sets
+that flag when its probe could not determine the remote's `annex.uuid`, which
+covers two very different cases: a stale probe against a repository BABS itself
+just `git annex init`-ed (clearing it is right), and a remote that genuinely has
+no annex (clearing it re-creates exactly the silent `copy (notneeded)` content
+loss described above). The design rule is: clear the flag only after positively
+demonstrating the endpoint is an annex, and otherwise fail at `babs init`.
+
+**`check-setup` should assert the content channel, not just the git channel.**
+`git annex fsck --fast -f <content sibling>` in `analysis` — note `-f/--from`;
+`--remote` is not a git-annex option — exercises uuid resolution and transport
+setup, and fails loudly when the sibling cannot actually receive content. It
+checks no data at that point (there are no results yet), which is the point: it
+is a cheap positive assertion that the second channel is live, before jobs are
+submitted. `merge.py` already runs the same command in `merge_ds` after
+merging. The sibling name has to come from the provider, since it is
+context-dependent (see the table above).
+
+**Naming.** `--output-remote` should stay one option accepting either shape
+(`metavar='PATH_OR_URL'`); naming it `…-path` would bake the narrowing into the
+user-facing API. Internally the base attribute stays a `str` URL — a
+`pathlib.Path` cannot hold `ssh://host/x` without mangling the `//` — and
+`Path` belongs only inside the local providers, where the value genuinely
+cannot be anything else. Help text and docstrings that say "path" today are
+accurately describing the narrowing, and should be widened with the behaviour,
+not before it.
+
 ## Testing
 
-- **Unit** — endpoint helpers are pure git plumbing over a URL, testable
+- **Unit** — the endpoint helpers are pure git plumbing over a URL, tested
   against `git init --bare` fixtures in `tmp_path` with no datalad: existence,
-  head hash, branch enumeration, lease-safe deletion, and that an unreachable
-  endpoint **raises** rather than returning `[]`.
+  head hash, branch enumeration, lease-safe deletion (from a cwd that is *not*
+  a repository), and that an unreachable endpoint **raises** rather than
+  returning `[]`. The providers are tested separately, including what
+  `--output-remote` must refuse.
 - **Regression** — pin Finding 3: an `ssh://user@host/path` push URL must not
   lose `user@host`.
 - **Existing e2e unchanged** — `tests/e2e-slurm/` must pass identically through
   the minimal increment. `tests/test_check_setup.py:52,83` construct
   `ria+file://…#<id>` URLs (as helper input, not assertions) and will need
   updating once addressing changes.
-- **New e2e** — the slurm test container can host a `ria+ssh://localhost` store,
-  exercising both the git and annex channels with no external infrastructure.
+- **Both providers end to end** — `tests/e2e_output_remote.py --provider both`
+  runs the whole cycle (`babs init` → `check-setup` → real participant jobs →
+  `babs merge` → a fresh consumer clone retrieving the merged results) against
+  the RIA default and against a plain bare repository. It is not wired into CI
+  (the `e2e-slurm` workflow is disabled upstream), so it is evidence rather
+  than a regression gate — wiring it in is worth more than any further unit
+  test here.
+- **Not yet covered** — a non-local output remote end to end, which the branch
+  does not support today. Once it does, the slurm test container can host an
+  `ssh://localhost` repository, exercising both channels with no external
+  infrastructure; and the non-bare `updateInstead` receiver deserves the same
+  cycle, since its failure mode (a dirty worktree refusing a push) only shows
+  up under a real merge.
 
 ## Still open
 
@@ -337,3 +527,10 @@ independent of remote support.
    `DSLOCKFILE` (`container.py:267`), logs (`container.py:299-302`). #404
    covers this as its single-control-plane contract; recorded here only for
    completeness.
+5. **Two BABS projects pointing at one `--output-remote`.** Nothing detects
+   it. Their `job-*` branches share a namespace and `babs merge` in either
+   project would enumerate and delete the other's. A guard (record the project
+   id in the endpoint, refuse a mismatch) is cheap; whether to make it an error
+   or a warning is a policy call.
+6. **Ref-deletion refusal on a hosted endpoint** — see above; needs a decision
+   on warn-and-leave vs. an alternative namespace that forges allow deleting.
