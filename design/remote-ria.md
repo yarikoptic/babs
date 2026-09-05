@@ -397,16 +397,10 @@ captures them where it lists the branches, and the push is `--atomic`, so a
 single refused lease cannot leave the rest of a chunk deleted with the caller
 unable to tell which.
 
-**What `--output-remote` refuses, and why one of those refusals is wrong.**
-A `ria+` URL must be refused: `output_ria_url` and `output_ria_path` stay
-pinned to the project's own store, so a foreign RIA store would be accepted at
-`babs init`, pass `check-setup`, run every job, and only fail at `babs merge` —
-after a full compute run. Failing at init is the honest behaviour until the RIA
-URL is plumbed through. Today that refusal is incidental: it falls out of the
-blanket rule that rejects anything that is not a local path, and it has to
-become an explicit check the moment URLs are accepted. That blanket rule also
-refuses every other **non-local** URL, which is a narrowing of this design
-rather than a property of it — see the next section.
+**What `--output-remote` refused.** The first cut of this branch accepted only
+a local path, refusing `ria+` URLs and every other non-local URL alike. That
+was a narrowing of this design rather than a property of it; the sections below
+record how it was reviewed and what replaced it.
 
 ## Review of the implementation — what it changes here
 
@@ -430,14 +424,13 @@ create-vs-validate:
 | local path not ending in `.git` | creates/manages a regular repository with a worktree, `receive.denyNonFastforwards=true` + `receive.denyCurrentBranch=updateInstead` |
 | local path that is (or should be) a RIA store | the RIA provider — still the default |
 
-**The narrowing to record.** The rule underneath that table — *create locally,
-validate remotely* — is the one this design intends, and BABS can only
+**The narrowing, and its removal.** The rule underneath that table — *create
+locally, validate remotely* — is the one this design intends, and BABS can only
 *guarantee* `git annex init` on an endpoint it can reach as a path. But that
 argument bounds creation only: an endpoint that already **is** an annex can be
-validated instead. `BareGitOutputRemote.__init__` currently raises on every
-non-local URL, so what this branch adds is a second **local** provider and
-#401's literal ask stays unmet. Restoring URL support is recovery of stated
-design, not new design work.
+validated instead. `BareGitOutputRemote.__init__` raised on every non-local URL,
+so the first cut added a second **local** provider and left #401's literal ask
+unmet. That is now fixed — see "The dispatch as built" below.
 
 **`receive.denyCurrentBranch=updateInstead` works, including for content.**
 Measured against a non-bare receiver carrying that config plus
@@ -481,9 +474,9 @@ context-dependent (see the table above).
 user-facing API. Internally the base attribute stays a `str` URL — a
 `pathlib.Path` cannot hold `ssh://host/x` without mangling the `//` — and
 `Path` belongs only inside the local providers, where the value genuinely
-cannot be anything else. Help text and docstrings that say "path" today are
-accurately describing the narrowing, and should be widened with the behaviour,
-not before it.
+cannot be anything else. Help text and docstrings that said "path" were
+accurately describing the narrowing, and were widened with the behaviour rather
+than before it.
 
 ### Second round of review
 
@@ -657,6 +650,48 @@ pre-existing behaviour affecting every project, not only remote endpoints, and
 it is Slurm's documented semantics rather than something measured here — there
 is no Slurm in the development container to demonstrate it, so it needs a real
 check before the change lands.
+
+### The dispatch as built
+
+The four-way dispatch is implemented. What a value means, with an existing
+target believed over its name:
+
+| `--output-remote` | provider | BABS |
+|---|---|---|
+| omitted | `RiaOutputRemote` | creates the store in the project root |
+| `/srv/store` | `RiaOutputRemote` | creates/uses a RIA store — a bare path stays RIA |
+| `ria+file:///srv/store` | `RiaOutputRemote` | the same, said explicitly |
+| `ria+ssh://host/srv/store` | `RiaOutputRemote` | datalad reaches the store over ssh |
+| `file:///srv/out.git` | `BareGitOutputRemote` | creates/manages a bare repository |
+| `file:///srv/out` | `WorktreeGitOutputRemote` | creates/manages one with a worktree |
+| `ssh://…`, `user@host:…`, `https://…` | `RemoteGitOutputRemote` | validates; never creates |
+
+Three things are worth recording about how it came out.
+
+**Classification is `RI`'s, the kinds are BABS's.** `babs/resource.py` asks
+`RI` what a value is and adds only policy — not empty, no whitespace, absolute
+— plus `existing_kind()`, which reads the target itself (`ria-layout-version`,
+`git rev-parse --is-bare-repository`) rather than inferring from the name. That
+is what lets a store whose directory follows no convention still be used as
+what it is.
+
+**The second and third providers cost little because the first was factored.**
+A shared `GitOutputRemote` holds the `annex-ignore` handling, the job
+content-push command and the context-dependent sibling naming;
+`WorktreeGitOutputRemote` is the `receive.*` configuration and its creation
+rule, `RemoteGitOutputRemote` is validation and nothing else, ~40 and ~30 lines.
+The `annex-ignore` positive-evidence check generalised exactly as its docstring
+predicted: `annex.uuid` locally, the `git-annex` branch probe over a transport.
+
+**What is verified, and what is not.** All three local providers run end to end
+in `tests/e2e_output_remote.py --provider both`, and the worktree receiver is
+asserted to *show* the merged results in place — the reason that provider
+exists. The remote provider's validation is unit-tested against local
+repositories (accepts one advertising a `git-annex` branch, refuses one without,
+refuses an unreachable endpoint, creates nothing), but no test drives a real
+`ssh://` endpoint or a `ria+ssh://` store: there is no ssh server in the
+development container. The transport itself is therefore unexercised, and that
+is the first thing to cover when one is available.
 
 ## Testing
 
