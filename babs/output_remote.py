@@ -29,6 +29,8 @@ import os.path as op
 import subprocess
 import warnings
 
+from babs import resource
+
 #: Name of the datalad sibling that receives the result *git refs*.
 GIT_SIBLING_NAME = 'output'
 
@@ -44,60 +46,6 @@ RIA_CONTENT_PUSH_COMMAND = 'datalad push --to output-storage'
 
 #: Name of the ORA special remote created by ``datalad create-sibling-ria``.
 RIA_CONTENT_SIBLING = 'output-storage'
-
-
-def _is_local_path(url):
-    """Whether ``url`` names a path on this filesystem.
-
-    Three forms are *not* local, and only the first is obvious:
-
-    * a real URL -- ``ssh://host/x``, ``https://host/x``;
-    * git's scp-style ssh syntax -- ``git@host:x``, ``user@host:/srv/x``,
-      ``host:/srv/x``. These carry no ``://`` and no scheme ``urlparse`` will
-      report, so a naive check treats them as paths: BABS would then
-      ``git init --bare`` a local directory literally named ``git@host:x``
-      while every job pushes over ssh to a host that was never annex-inited,
-      and the content would go nowhere. Git's own rule is: no ``://``, and a
-      colon before the first slash.
-    * a relative path -- git resolves a relative remote against ``analysis/``,
-      not the directory ``babs init`` ran in, so the store BABS prepares and
-      the one jobs push to would be different directories.
-    """
-    if url.startswith('file://'):
-        url = url[len('file://') :]
-    elif '://' in url:
-        return False
-    if ':' in url.split('/', 1)[0]:
-        return False
-    # Whitespace survives `babs init` and `babs check-setup` and then breaks
-    # every submitted job: the generated submit template embeds the push URL
-    # unquoted and `scheduler.py` splits the command on whitespace, so the
-    # path becomes two argv entries and the subject list is read from the
-    # tail of the path. Refuse it here, where the message can say why.
-    if any(c.isspace() for c in url):
-        return False
-    return op.isabs(op.expanduser(url))
-
-
-def _why_not_local(url):
-    """One sentence naming the rule `url` broke, for the error message."""
-    if not url:
-        return 'it is empty.'
-    if '://' in url and not url.startswith('file://'):
-        return 'it is a URL, not a filesystem path.'
-    if ':' in url.split('/', 1)[0]:
-        return "it is an ssh URL in git's scp-style syntax, not a filesystem path."
-    if any(c.isspace() for c in url):
-        return (
-            'it contains whitespace, which the generated job submission command '
-            'would split into separate arguments.'
-        )
-    if not op.isabs(url):
-        return (
-            'it is a relative path; git would resolve it against `analysis/` rather '
-            'than the directory `babs init` ran in.'
-        )
-    return 'it is not a usable local path.'
 
 
 #: git-annex's own branch, which `git annex init` creates. It is never the
@@ -255,15 +203,16 @@ class BareGitOutputRemote(OutputRemote):
 
     def __init__(self, url):
         super().__init__(url)
-        self.url = op.expanduser(self.url.removeprefix('file://'))
-        if not _is_local_path(self.url):
+        repo_path = resource.usable_local_path(self.url)
+        if repo_path is None:
             raise ValueError(
-                f"'--output-remote {self.url}' cannot be used: {_why_not_local(self.url)} "
+                f"'--output-remote {self.url}' cannot be used: "
+                f'{resource.why_not_usable(self.url)} '
                 'BABS can only guarantee that a repository is git-annex-initialized '
                 '(and so able to receive result *content*) when it can reach it as a '
                 'local path.'
             )
-        self.repo_path = op.abspath(op.expanduser(self.url))
+        self.repo_path = repo_path
         self.url = self.repo_path
 
     # ---------------- `babs init` ----------------

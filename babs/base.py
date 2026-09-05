@@ -11,6 +11,7 @@ import datalad.api as dlapi
 import pandas as pd
 import yaml
 
+from babs import resource
 from babs.git_endpoint import list_result_branches
 from babs.input_datasets import InputDatasets, OutputDatasets
 from babs.output_remote import make_output_remote, output_remote_from_config
@@ -398,17 +399,7 @@ class BABS:
     @staticmethod
     def source_to_local_path(source: str) -> str | None:
         """Convert a local dataset source URL/path to a filesystem path."""
-        if not source:
-            return None
-        if source.startswith('ria+file://'):
-            local_path = source[len('ria+file://') :]
-        elif source.startswith('file://'):
-            local_path = source[len('file://') :]
-        elif '://' not in source:
-            local_path = source
-        else:
-            return None
-        return local_path.split('#', 1)[0]
+        return resource.local_path(source)
 
     def analysis_git_config_path(self) -> str | None:
         """Return absolute path to analysis git config file."""
