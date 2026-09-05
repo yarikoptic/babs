@@ -12,8 +12,11 @@ It runs once per provider:
 
 * ``ria``      -- the historical default, unchanged: an output RIA store
                   inside the project root, with an ORA content sibling.
-* ``bare-git`` -- ``babs init --output-remote /path/to/output.git``: one plain
-                  bare git repository carrying both publication channels.
+* ``bare-git`` -- ``babs init --output-remote file:///path/to/output.git``: one
+                  plain bare git repository carrying both publication channels.
+* ``worktree-git`` -- ``babs init --output-remote file:///path/to/output``: a
+                  regular repository with a worktree, receiving pushes through
+                  ``receive.denyCurrentBranch=updateInstead``.
 
 The point of running both is that the second must work *and* the first must
 still work.
@@ -363,14 +366,17 @@ def check_two_phase_publication(analysis_path, babs_proj):
 
 def check_content_reached_the_endpoint(babs_proj, provider):
     """The annexed zips must be *in* the endpoint, not merely referenced."""
-    if provider == 'bare-git':
-        objects = list((Path(babs_proj.output_git_url) / 'annex' / 'objects').rglob('*.zip'))
+    if provider in ('bare-git', 'worktree-git'):
+        repo = Path(babs_proj.output_git_url)
+        # a repository with a worktree keeps its annex under `.git/`
+        annex = repo / 'annex' if (repo / 'annex').is_dir() else repo / '.git' / 'annex'
+        objects = list((annex / 'objects').rglob('*.zip'))
         expect(
             len(objects) >= len(SUBJECTS),
-            f'Expected >= {len(SUBJECTS)} annexed zips in the bare output remote, '
+            f'Expected >= {len(SUBJECTS)} annexed zips in the git output remote, '
             f'found {len(objects)}',
         )
-        print(f'  annexed objects in the bare output remote: {len(objects)}')
+        print(f'  annexed objects in the git output remote: {len(objects)}')
     else:
         store = Path(babs_proj.output_ria_path)
         objects = list(store.rglob('*.zip'))
@@ -380,6 +386,23 @@ def check_content_reached_the_endpoint(babs_proj, provider):
             f'found {len(objects)}',
         )
         print(f'  annexed objects in the output RIA store: {len(objects)}')
+
+
+def check_worktree_shows_the_results(endpoint):
+    """The point of the worktree provider: results readable in place.
+
+    `receive.denyCurrentBranch=updateInstead` makes the receiver check out
+    what was pushed, so after `babs merge` pushes the merge commit the zips
+    are visible in the directory itself -- no clone needed.
+    """
+    print('\n== The receiving worktree itself shows the merged results')
+    for sub in SUBJECTS:
+        name = zip_name(sub)
+        expect(
+            (endpoint / name).is_symlink() or (endpoint / name).exists(),
+            f'{name} is not present in the receiving worktree {endpoint}',
+        )
+    print(f'  {endpoint} lists: {sorted(p.name for p in endpoint.glob("*.zip"))}')
 
 
 def check_fresh_clone_can_retrieve(babs_proj, clone_path):
@@ -434,9 +457,10 @@ def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurr
         '--queue',
         'slurm',
     ]
-    bare_repo = root / 'output.git'
-    if provider == 'bare-git':
-        init_cmd += ['--output-remote', str(bare_repo)]
+    endpoints = {'bare-git': root / 'output.git', 'worktree-git': root / 'output'}
+    endpoint = endpoints.get(provider)
+    if endpoint is not None:
+        init_cmd += ['--output-remote', f'file://{endpoint}']
 
     print('\n== babs init')
     run(init_cmd)
@@ -457,10 +481,22 @@ def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurr
         )
     else:
         expect(
-            proj_config.get('output_remote') == {'type': 'bare-git', 'url': str(bare_repo)},
+            proj_config.get('output_remote') == {'type': provider, 'url': str(endpoint)},
             f'Unexpected output_remote in project config: {proj_config.get("output_remote")}',
         )
-        expect(bare_repo.is_dir(), f'`babs init` did not create {bare_repo}')
+        expect(endpoint.is_dir(), f'`babs init` did not create {endpoint}')
+        if provider == 'worktree-git':
+            for key, value in (
+                ('receive.denyNonFastforwards', 'true'),
+                ('receive.denyCurrentBranch', 'updateInstead'),
+            ):
+                actual = subprocess.run(
+                    ['git', '-C', str(endpoint), 'config', '--get', key],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+                expect(actual == value, f'{key} is {actual!r} at {endpoint}, expected {value!r}')
 
     print('\n== babs check-setup')
     run([*BABS_CLI, 'check-setup', str(project_root)])
@@ -519,6 +555,9 @@ def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurr
     print('\n== After the merge: result branches are gone from the endpoint')
     check_result_branches(babs_proj, 0)
 
+    if provider == 'worktree-git':
+        check_worktree_shows_the_results(endpoint)
+
     check_fresh_clone_can_retrieve(babs_proj, root / 'verify_clone')
 
     print(f'\n== PROVIDER {provider}: OK')
@@ -528,7 +567,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--provider',
-        choices=['ria', 'bare-git', 'both'],
+        choices=['ria', 'bare-git', 'worktree-git', 'both'],
         default='both',
         help='Which output remote(s) to exercise.',
     )
@@ -549,7 +588,7 @@ def main(argv=None):
     print(f'Work directory: {workdir}')
     assert_using_this_tree()
 
-    providers = ['ria', 'bare-git'] if args.provider == 'both' else [args.provider]
+    providers = ['ria', 'bare-git', 'worktree-git'] if args.provider == 'both' else [args.provider]
     try:
         shim_dir = write_shims(workdir / 'shims')
         bids_path = make_bids_dataset(workdir / 'ds000003-demo')

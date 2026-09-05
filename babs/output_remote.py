@@ -28,8 +28,10 @@ import os
 import os.path as op
 import subprocess
 import warnings
+from typing import ClassVar
 
 from babs import resource
+from babs.git_endpoint import GitEndpointError, ls_remote_heads
 
 #: Name of the datalad sibling that receives the result *git refs*.
 GIT_SIBLING_NAME = 'output'
@@ -49,8 +51,10 @@ RIA_CONTENT_SIBLING = 'output-storage'
 
 
 #: git-annex's own branch, which `git annex init` creates. It is never the
-#: branch a reader of the results wants HEAD to point at.
-_ANNEX_BRANCH = 'refs/heads/git-annex'
+#: branch a reader of the results wants HEAD to point at, and its presence
+#: at an endpoint is what says the endpoint is a git-annex repository.
+_ANNEX_BRANCH_NAME = 'git-annex'
+_ANNEX_BRANCH = 'refs/heads/' + _ANNEX_BRANCH_NAME
 
 
 def _run_git_ok(args):
@@ -129,15 +133,40 @@ class OutputRemote:
 
 
 class RiaOutputRemote(OutputRemote):
-    """The default: an output RIA store inside the BABS project root."""
+    """A RIA store: the project's own by default, or one named explicitly.
+
+    Accepts a filesystem path, a ``ria+file://`` URL, or a ``ria+ssh://`` (or
+    http(s)) URL for a store datalad reaches over that transport. Only a local
+    store has a ``store_path``; for a remote one datalad does the work and
+    BABS does not touch the store's layout itself.
+    """
 
     type = 'ria'
 
-    def __init__(self, store_path):
-        self.store_path = str(store_path)
-        super().__init__('ria+file://' + self.store_path)
+    def __init__(self, store, in_project=False):
+        store = str(store)
+        #: The in-project default is not recorded in the project config, so
+        #: that "no `output_remote` section" keeps meaning exactly that.
+        self.in_project = in_project
+        if resource.is_ria(store):
+            url = store
+            self.store_path = resource.local_path(store)
+        else:
+            path = resource.usable_local_path(store)
+            if path is None:
+                raise ValueError(
+                    f"'--output-remote {store}' cannot be used: {resource.why_not_usable(store)}"
+                )
+            self.store_path = path
+            url = 'ria+file://' + path
+        super().__init__(url)
 
     def create_sibling(self, dataset, sibling_kwargs):
+        if self.store_path is None:
+            # The `alias/data` symlink `finalize` writes for a local store has
+            # to be created by datalad, over the same transport it uses to
+            # reach the store.
+            sibling_kwargs = dict(sibling_kwargs, alias='data')
         dataset.create_sibling_ria(
             name=GIT_SIBLING_NAME,
             url=self.url,
@@ -145,10 +174,15 @@ class RiaOutputRemote(OutputRemote):
             **sibling_kwargs,
         )
 
+    def to_config(self):
+        return None if self.in_project else {'type': self.type, 'url': self.url}
+
     def resolve_git_endpoint(self, recorded_push_url):
         # If the recorded URL points at the RIA store root rather than at the
         # dataset directory (no `.git` there), resolve it through the
         # `alias/data` symlink, e.g. output_ria/alias/data -> XX/xxx-uuid.
+        if self.store_path is None:
+            return recorded_push_url
         if not op.exists(op.join(recorded_push_url, '.git')):
             alias_link = op.join(self.store_path, 'alias', 'data')
             if op.exists(alias_link) and os.path.islink(alias_link):
@@ -157,6 +191,8 @@ class RiaOutputRemote(OutputRemote):
 
     def finalize(self, git_endpoint):
         """Add the ``alias/data`` symlink into the output RIA store."""
+        if self.store_path is None:
+            return  # created by datalad at `create_sibling` time
         print("Adding an alias 'data' to output RIA store...")
         alias_dir = op.join(self.store_path, 'alias')
         if not op.exists(alias_dir):
@@ -189,8 +225,8 @@ class RiaOutputRemote(OutputRemote):
         return RIA_CONTENT_SIBLING
 
 
-class BareGitOutputRemote(OutputRemote):
-    """A plain bare git repository that carries *both* publication channels.
+class GitOutputRemote(OutputRemote):
+    """A git repository that carries *both* publication channels.
 
     The same URL that receives the result branches also stores the annexed
     zip files, which is what makes this usable when the receiver is not the
@@ -199,29 +235,10 @@ class BareGitOutputRemote(OutputRemote):
     controller can reach.
     """
 
-    type = 'bare-git'
-
-    def __init__(self, url):
-        super().__init__(url)
-        repo_path = resource.usable_local_path(self.url)
-        if repo_path is None:
-            raise ValueError(
-                f"'--output-remote {self.url}' cannot be used: "
-                f'{resource.why_not_usable(self.url)} '
-                'BABS can only guarantee that a repository is git-annex-initialized '
-                '(and so able to receive result *content*) when it can reach it as a '
-                'local path.'
-            )
-        self.repo_path = repo_path
-        self.url = self.repo_path
-
     # ---------------- `babs init` ----------------
-    def create_sibling(self, dataset, sibling_kwargs):
-        shared = sibling_kwargs.get('shared')
-        self._ensure_bare_repo(shared, sibling_kwargs.get('group'))
-        self._ensure_annex()
-        dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
-        self._clear_stale_annex_ignore(dataset.path)
+    def _annex_evidence(self):
+        """Positive evidence that the endpoint really is a git-annex repository."""
+        raise NotImplementedError
 
     def _clear_stale_annex_ignore(self, dataset_path):
         """Clear `annex-ignore` only when the endpoint provably *is* an annex.
@@ -253,19 +270,16 @@ class BareGitOutputRemote(OutputRemote):
         if proc.returncode != 0 or proc.stdout.strip() != 'true':
             return  # unset or already false: git-annex's own view is fine
 
-        # The positive check. For a local repository the annex uuid is
-        # authoritative; a URL endpoint would instead have to advertise a
-        # `git-annex` branch.
-        if not self.annex_uuid():
+        if not self._annex_evidence():
             raise ValueError(
-                f"git-annex marked the output remote '{self.repo_path}' as annex-ignore, "
-                'and it has no annex.uuid -- so it cannot store result content, and every '
-                'job would publish a result branch whose data is nowhere. Run '
+                f"git-annex marked the output remote '{self.url}' as annex-ignore, and it "
+                'is not a git-annex repository -- so it cannot store result content, and '
+                'every job would publish a result branch whose data is nowhere. Run '
                 '`git annex init` in it, or point `--output-remote` elsewhere.'
             )
         warnings.warn(
             f"remote.{GIT_SIBLING_NAME}.annex-ignore was set to 'true' for "
-            f"'{self.repo_path}', which is a git-annex repository -- git-annex's probe "
+            f"'{self.url}', which is a git-annex repository -- git-annex's probe "
             'must have failed transiently. Clearing it, so result content can be pushed.',
             stacklevel=2,
         )
@@ -275,35 +289,68 @@ class BareGitOutputRemote(OutputRemote):
             check=True,
         )
 
-    def _ensure_bare_repo(self, shared=None, group=None):
-        """Create the bare repository if needed; validate it if it exists."""
-        if op.exists(self.repo_path):
-            # Check this before anything shells out with cwd=repo_path: Popen
-            # raises NotADirectoryError on a file, which would surface as a
-            # traceback instead of the message below.
-            if not op.isdir(self.repo_path):
-                raise ValueError(
-                    f"'--output-remote {self.repo_path}' exists but is a file, not a directory."
-                )
-            if self._is_bare_repo():
-                return
-            if not op.isdir(self.repo_path):
-                raise ValueError(
-                    f"'--output-remote {self.repo_path}' exists but is a file, not a directory."
-                )
-            if os.listdir(self.repo_path):
-                # Either a non-bare repo (which would refuse pushes to its
-                # checked-out branch) or somebody's data -- a typo in
-                # `--output-remote` must not scatter git internals into it.
-                raise ValueError(
-                    f"'--output-remote {self.repo_path}' exists but is not a bare git "
-                    'repository, and is not empty. Point `--output-remote` at a bare '
-                    'repository (`git init --bare`), an empty directory, or a path '
-                    'that does not exist yet.'
-                )
-            # An existing empty directory is fine: initialise into it.
+    # ---------------- addressing ----------------
+    def finalize(self, git_endpoint):
+        """Nothing to do: a repository with a worktree already has a `HEAD`."""
+
+    def clone_source(self, git_endpoint, analysis_dataset_id):
+        return git_endpoint
+
+    # ---------------- generated code ----------------
+    @property
+    def job_content_push_echo(self):
+        return '# Push result file content to the output remote:'
+
+    @property
+    def job_content_push_command(self):
+        # Content only: the result branch is pushed separately, and last, so
+        # that a visible result branch always implies retrievable content.
+        # `--in here` restricts the transfer to content this job actually has.
+        return f'git annex copy --to {JOB_GIT_REMOTE_NAME} --in here .'
+
+    @property
+    def merge_content_remote(self):
+        # `merge_ds` is a plain clone of the repository, so the remote that
+        # holds the content is `origin` itself.
+        return 'origin'
+
+    @property
+    def analysis_content_remote(self):
+        # One sibling carries both channels here, so content lives on the
+        # same remote as the refs.
+        return GIT_SIBLING_NAME
+
+    def to_config(self):
+        return {'type': self.type, 'url': self.url}
+
+
+class LocalGitOutputRemote(GitOutputRemote):
+    """A repository on this filesystem, which BABS creates and manages."""
+
+    def __init__(self, url):
+        super().__init__(url)
+        repo_path = resource.usable_local_path(self.url)
+        if repo_path is None:
+            raise ValueError(
+                f"'--output-remote {self.url}' cannot be used: {resource.why_not_usable(self.url)}"
+            )
+        self.repo_path = repo_path
+        self.url = self.repo_path
+
+    def create_sibling(self, dataset, sibling_kwargs):
+        self._ensure_repo(sibling_kwargs.get('shared'), sibling_kwargs.get('group'))
+        self._ensure_annex()
+        dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
+        self._clear_stale_annex_ignore(dataset.path)
+
+    def _ensure_repo(self, shared=None, group=None):
+        """Create the repository if needed; validate it if it exists."""
+        raise NotImplementedError
+
+    def _init_repo(self, extra_args, shared, group):
+        """`git init` the repository, then apply the shared-group ownership."""
         os.makedirs(op.dirname(self.repo_path), exist_ok=True)
-        cmd = ['git', 'init', '--bare']
+        cmd = ['git', 'init', *extra_args]
         if shared:
             cmd.append(f'--shared={shared}')
         cmd.append(self.repo_path)
@@ -327,15 +374,19 @@ class BareGitOutputRemote(OutputRemote):
                     f"'{self.repo_path}': {proc.stderr.strip()}"
                 )
 
-    def _is_bare_repo(self):
-        proc = subprocess.run(
-            ['git', 'rev-parse', '--is-bare-repository'],
-            cwd=self.repo_path,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return proc.returncode == 0 and proc.stdout.strip() == 'true'
+    def _refuse_if_unusable_directory(self):
+        """Common checks before anything shells out with ``cwd=repo_path``.
+
+        `Popen` raises `NotADirectoryError` on a file, which would surface as
+        a traceback rather than a message naming what is wrong.
+        """
+        if op.exists(self.repo_path) and not op.isdir(self.repo_path):
+            raise ValueError(
+                f"'--output-remote {self.repo_path}' exists but is a file, not a directory."
+            )
+
+    def _existing_kind(self):
+        return resource.existing_kind(self.repo_path)
 
     def annex_uuid(self):
         """Return the repository's ``annex.uuid``, or ``''`` if it has none."""
@@ -348,8 +399,11 @@ class BareGitOutputRemote(OutputRemote):
         )
         return proc.stdout.strip() if proc.returncode == 0 else ''
 
+    def _annex_evidence(self):
+        return bool(self.annex_uuid())
+
     def _ensure_annex(self):
-        """Make the bare repository a git-annex repository.
+        """Make the repository a git-annex repository.
 
         Without this, the repository has no ``annex.uuid``; git-annex then
         treats it as a git-only remote and *silently* transfers no content
@@ -368,10 +422,35 @@ class BareGitOutputRemote(OutputRemote):
         if not self.annex_uuid():
             raise RuntimeError(
                 f"`git annex init` in '{self.repo_path}' did not set annex.uuid; "
-                'this bare repository cannot receive result content.'
+                'this repository cannot receive result content.'
             )
 
-    # ---------------- addressing ----------------
+
+class BareGitOutputRemote(LocalGitOutputRemote):
+    """A plain bare git repository: `--output-remote file:///srv/out.git`."""
+
+    type = 'bare-git'
+
+    def _ensure_repo(self, shared=None, group=None):
+        self._refuse_if_unusable_directory()
+        if op.isdir(self.repo_path):
+            kind = self._existing_kind()
+            if kind == 'bare':
+                return
+            if kind is not None or os.listdir(self.repo_path):
+                # A repository with a worktree (which would refuse pushes to
+                # its checked-out branch), a RIA store, or somebody's data --
+                # a typo in `--output-remote` must not scatter git internals
+                # into it.
+                raise ValueError(
+                    f"'--output-remote {self.repo_path}' exists but is not a bare git "
+                    'repository, and is not empty. Point `--output-remote` at a bare '
+                    'repository (`git init --bare`), an empty directory, or a path '
+                    'that does not exist yet.'
+                )
+            # An existing empty directory is fine: initialise into it.
+        self._init_repo(['--bare'], shared, group)
+
     def finalize(self, git_endpoint):
         """Point the bare repository's ``HEAD`` at the branch BABS publishes.
 
@@ -401,39 +480,117 @@ class BareGitOutputRemote(OutputRemote):
                 )
                 return
 
-    def clone_source(self, git_endpoint, analysis_dataset_id):
-        return git_endpoint
 
-    # ---------------- generated code ----------------
-    @property
-    def job_content_push_echo(self):
-        return '# Push result file content to the output remote:'
+class WorktreeGitOutputRemote(LocalGitOutputRemote):
+    """A regular repository with a worktree: `--output-remote file:///srv/out`.
 
-    @property
-    def job_content_push_command(self):
-        # Content only: the result branch is pushed separately, and last, so
-        # that a visible result branch always implies retrievable content.
-        # `--in here` restricts the transfer to content this job actually has.
-        return f'git annex copy --to {JOB_GIT_REMOTE_NAME} --in here .'
+    A repository with a checked-out branch normally refuses a push into it.
+    ``receive.denyCurrentBranch=updateInstead`` makes it accept one and update
+    its working tree with it, which is what makes the results *readable in
+    place* rather than only through a clone. Two things follow from that and
+    are worth knowing: the push is refused while the worktree is dirty, and
+    since jobs only ever push ``job-*`` branches, the checkout advances when
+    ``babs merge`` pushes the main branch, not per job.
+    """
 
-    @property
-    def merge_content_remote(self):
-        # `merge_ds` is a plain clone of the bare repository, so the remote
-        # that holds the content is `origin` itself.
-        return 'origin'
+    type = 'worktree-git'
 
-    @property
-    def analysis_content_remote(self):
-        # One sibling carries both channels here, so content lives on the
-        # same remote as the refs.
-        return GIT_SIBLING_NAME
+    #: Pushes into this repository must not rewrite history, and must update
+    #: the worktree rather than being refused for touching a checked-out branch.
+    RECEIVE_CONFIG: ClassVar[dict] = {
+        'receive.denyNonFastforwards': 'true',
+        'receive.denyCurrentBranch': 'updateInstead',
+    }
 
-    def to_config(self):
-        return {'type': self.type, 'url': self.repo_path}
+    def _ensure_repo(self, shared=None, group=None):
+        self._refuse_if_unusable_directory()
+        kind = self._existing_kind() if op.isdir(self.repo_path) else None
+        if kind is None:
+            if op.isdir(self.repo_path) and os.listdir(self.repo_path):
+                raise ValueError(
+                    f"'--output-remote {self.repo_path}' exists but is not a git "
+                    'repository, and is not empty. Point `--output-remote` at a git '
+                    'repository, an empty directory, or a path that does not exist yet.'
+                )
+            self._init_repo([], shared, group)
+        elif kind != 'worktree':
+            raise ValueError(
+                f"'--output-remote {self.repo_path}' is an existing {kind} repository, "
+                "but was given as a plain `file://` path, which means 'a repository with "
+                "a worktree'. Add a `.git` suffix for a bare repository, or use "
+                'a `ria+file://` URL for a RIA store.'
+            )
+        for key, value in self.RECEIVE_CONFIG.items():
+            subprocess.run(
+                ['git', '-C', self.repo_path, 'config', key, value],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+
+class RemoteGitOutputRemote(GitOutputRemote):
+    """A git repository BABS cannot reach as a path: ssh, https, a forge.
+
+    BABS never creates one. It cannot run ``git annex init`` over a git
+    transport, and a repository that is not annex-initialized accepts the
+    result *branches* while silently dropping the result *content*
+    (``datalad push`` reports ``copy (notneeded)``, transfers zero objects and
+    exits 0). So the endpoint is validated instead: it must be reachable, and
+    it must advertise a ``git-annex`` branch, which is what distinguishes an
+    annex-capable receiver (forgejo-aneksajo, GIN, or any repository someone
+    ran ``git annex init`` in) from a plain git host.
+    """
+
+    type = 'remote-git'
+
+    def create_sibling(self, dataset, sibling_kwargs):
+        self._validate_endpoint()
+        dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.url)
+        self._clear_stale_annex_ignore(dataset.path)
+
+    def _validate_endpoint(self):
+        try:
+            heads = ls_remote_heads(self.url)
+        except GitEndpointError as exc:
+            raise ValueError(
+                f"'--output-remote {self.url}' cannot be reached: {exc}\n"
+                'BABS does not create repositories over a git transport. Create it '
+                'there, run `git annex init` in it, and try again.'
+            ) from exc
+        if _ANNEX_BRANCH_NAME not in heads:
+            raise ValueError(
+                f"'--output-remote {self.url}' is reachable but does not advertise a "
+                "'git-annex' branch, so it is not a git-annex repository. Result "
+                '*content* would silently not transfer, leaving every job with a '
+                'result branch whose data is nowhere. Run `git annex init` in it '
+                '(the host must support git-annex, e.g. forgejo-aneksajo or GIN).'
+            )
+
+    def _annex_evidence(self):
+        try:
+            return _ANNEX_BRANCH_NAME in ls_remote_heads(self.url)
+        except GitEndpointError:
+            return False
 
 
 def make_output_remote(output_ria_path, output_remote=None):
     """Build the output remote provider for a BABS project.
+
+    The value's shape says what kind of endpoint it is, and an existing target
+    is believed over its name:
+
+    ============================== =========================================
+    ``--output-remote``            provider
+    ============================== =========================================
+    omitted                        RIA store inside the project root
+    ``/srv/store``                 RIA store there (a bare path stays RIA)
+    ``ria+file:///srv/store``      the same, said explicitly
+    ``ria+ssh://host/srv/store``   a RIA store datalad reaches over ssh
+    ``file:///srv/out.git``        a bare git repository BABS manages
+    ``file:///srv/out``            a git repository with a worktree
+    ``ssh://…``, ``git@host:…``    an existing repository, validated not created
+    ============================== =========================================
 
     Parameters
     ----------
@@ -444,8 +601,34 @@ def make_output_remote(output_ria_path, output_remote=None):
         RIA behaviour.
     """
     if output_remote is None:
-        return RiaOutputRemote(output_ria_path)
-    return BareGitOutputRemote(output_remote)
+        return RiaOutputRemote(output_ria_path, in_project=True)
+
+    if resource.is_ria(output_remote):
+        return RiaOutputRemote(output_remote)
+
+    if resource.local_path(output_remote) is None:
+        return RemoteGitOutputRemote(output_remote)
+
+    path = resource.usable_local_path(output_remote)
+    if path is None:
+        raise ValueError(
+            f"'--output-remote {output_remote}' cannot be used: "
+            f'{resource.why_not_usable(output_remote)}'
+        )
+
+    kind = resource.existing_kind(path)
+    if kind is None:
+        # Nothing there yet, so the way it was written decides. A bare path
+        # keeps meaning a RIA store, which is what BABS has always created.
+        if not resource.is_file_url(output_remote):
+            kind = 'ria'
+        else:
+            kind = 'bare' if path.endswith('.git') else 'worktree'
+    return {
+        'ria': RiaOutputRemote,
+        'bare': BareGitOutputRemote,
+        'worktree': WorktreeGitOutputRemote,
+    }[kind](path)
 
 
 def output_remote_from_config(output_ria_path, config_section):
@@ -455,23 +638,30 @@ def output_remote_from_config(output_ria_path, config_section):
     ``output_remote`` section; that is the RIA default.
     """
     if not config_section:
-        return RiaOutputRemote(output_ria_path)
+        return RiaOutputRemote(output_ria_path, in_project=True)
     if not isinstance(config_section, dict):
         raise TypeError(
             f"'output_remote' in babs_proj_config.yaml must be a mapping, "
             f'got {type(config_section).__name__}'
         )
     remote_type = config_section.get('type', RiaOutputRemote.type)
-    if remote_type == RiaOutputRemote.type:
-        return RiaOutputRemote(output_ria_path)
-    if remote_type == BareGitOutputRemote.type:
-        url = config_section.get('url')
-        if not url:
-            raise ValueError(
-                "'output_remote' of type 'bare-git' in babs_proj_config.yaml is missing its 'url'."
-            )
-        return BareGitOutputRemote(url)
-    raise ValueError(
-        f"Unknown 'output_remote.type' in babs_proj_config.yaml: {remote_type!r}. "
-        f"Known types: '{RiaOutputRemote.type}', '{BareGitOutputRemote.type}'."
-    )
+    providers = {
+        RiaOutputRemote.type: RiaOutputRemote,
+        BareGitOutputRemote.type: BareGitOutputRemote,
+        WorktreeGitOutputRemote.type: WorktreeGitOutputRemote,
+        RemoteGitOutputRemote.type: RemoteGitOutputRemote,
+    }
+    if remote_type not in providers:
+        raise ValueError(
+            f"Unknown 'output_remote.type' in babs_proj_config.yaml: {remote_type!r}. "
+            f'Known types: {", ".join(repr(name) for name in providers)}.'
+        )
+    url = config_section.get('url')
+    if not url:
+        if remote_type == RiaOutputRemote.type:
+            return RiaOutputRemote(output_ria_path, in_project=True)
+        raise ValueError(
+            f"'output_remote' of type {remote_type!r} in babs_proj_config.yaml "
+            "is missing its 'url'."
+        )
+    return providers[remote_type](url)

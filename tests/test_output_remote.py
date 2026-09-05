@@ -12,7 +12,9 @@ import pytest
 from babs.git_endpoint import list_result_branches
 from babs.output_remote import (
     BareGitOutputRemote,
+    RemoteGitOutputRemote,
     RiaOutputRemote,
+    WorktreeGitOutputRemote,
     make_output_remote,
     output_remote_from_config,
 )
@@ -31,10 +33,43 @@ class TestSelection:
         assert remote.type == 'ria'
         assert remote.url == 'ria+file://' + str(tmp_path / 'output_ria')
 
-    def test_explicit_path_selects_bare_git(self, tmp_path):
-        remote = make_output_remote(str(tmp_path / 'output_ria'), str(tmp_path / 'out.git'))
-        assert isinstance(remote, BareGitOutputRemote)
-        assert remote.type == 'bare-git'
+    @pytest.mark.parametrize(
+        ('value', 'provider', 'type_name'),
+        [
+            # a bare path keeps meaning a RIA store, as it always has
+            ('{tmp}/store', RiaOutputRemote, 'ria'),
+            ('ria+file://{tmp}/store', RiaOutputRemote, 'ria'),
+            ('ria+ssh://host/srv/store', RiaOutputRemote, 'ria'),
+            # `file://` names a plain git repository; `.git` says bare
+            ('file://{tmp}/out.git', BareGitOutputRemote, 'bare-git'),
+            ('file://{tmp}/out', WorktreeGitOutputRemote, 'worktree-git'),
+            # anything BABS cannot reach as a path is validated, not created
+            ('ssh://user@host/srv/out.git', RemoteGitOutputRemote, 'remote-git'),
+            ('git@host:out.git', RemoteGitOutputRemote, 'remote-git'),
+            ('https://forge.org/u/r.git', RemoteGitOutputRemote, 'remote-git'),
+        ],
+    )
+    def test_the_value_shape_selects_the_provider(self, tmp_path, value, provider, type_name):
+        remote = make_output_remote(str(tmp_path / 'output_ria'), value.format(tmp=str(tmp_path)))
+        assert isinstance(remote, provider)
+        assert remote.type == type_name
+
+    def test_an_existing_target_is_believed_over_its_name(self, tmp_path):
+        """A store whose directory does not follow the convention is still
+        recognised for what it is, rather than being re-created as something
+        else on top of it."""
+        bare = tmp_path / 'no-suffix'
+        _git('init', '--bare', '-q', str(bare))
+        assert isinstance(
+            make_output_remote(str(tmp_path / 'output_ria'), f'file://{bare}'),
+            BareGitOutputRemote,
+        )
+        tree = tmp_path / 'tree.git'
+        _git('init', '-q', str(tree))
+        assert isinstance(
+            make_output_remote(str(tmp_path / 'output_ria'), f'file://{tree}'),
+            WorktreeGitOutputRemote,
+        )
 
     def test_a_project_predating_this_feature_gets_the_ria_default(self, tmp_path):
         """An existing project's babs_proj_config.yaml has no `output_remote`."""
@@ -42,14 +77,23 @@ class TestSelection:
             remote = output_remote_from_config(str(tmp_path / 'output_ria'), absent)
             assert isinstance(remote, RiaOutputRemote)
 
-    def test_round_trips_through_config(self, tmp_path):
-        bare = tmp_path / 'out.git'
-        remote = make_output_remote(str(tmp_path / 'output_ria'), str(bare))
+    @pytest.mark.parametrize(
+        ('value', 'expected_type'),
+        [
+            ('file://{tmp}/out.git', 'bare-git'),
+            ('file://{tmp}/out', 'worktree-git'),
+            ('ssh://host/srv/out.git', 'remote-git'),
+            ('{tmp}/store', 'ria'),
+        ],
+    )
+    def test_round_trips_through_config(self, tmp_path, value, expected_type):
+        value = value.format(tmp=str(tmp_path))
+        remote = make_output_remote(str(tmp_path / 'output_ria'), value)
         cfg = remote.to_config()
-        assert cfg == {'type': 'bare-git', 'url': str(bare)}
+        assert cfg['type'] == expected_type
         rebuilt = output_remote_from_config(str(tmp_path / 'output_ria'), cfg)
-        assert isinstance(rebuilt, BareGitOutputRemote)
-        assert rebuilt.repo_path == str(bare)
+        assert type(rebuilt) is type(remote)
+        assert rebuilt.url == remote.url
 
     def test_ria_default_is_not_recorded_in_the_project_config(self, tmp_path):
         assert make_output_remote(str(tmp_path / 'output_ria')).to_config() is None
@@ -62,10 +106,10 @@ class TestSelection:
         with pytest.raises(ValueError, match='url'):
             output_remote_from_config(str(tmp_path), {'type': 'bare-git'})
 
-    def test_non_local_url_is_refused_loudly(self, tmp_path):
-        # BABS cannot guarantee `git annex init` on the far side, and a bare
-        # repo without an annex silently drops result *content*.
-        with pytest.raises(ValueError, match='local path'):
+    def test_a_managed_provider_still_refuses_a_url(self):
+        """The local providers create and annex-init a repository, which they
+        can only do through the filesystem."""
+        with pytest.raises(ValueError, match='filesystem'):
             BareGitOutputRemote('ssh://user@host/srv/out.git')
 
 
@@ -73,7 +117,7 @@ class TestBareGitCreation:
     def test_creates_a_bare_repo_that_can_hold_annexed_content(self, tmp_path):
         bare = tmp_path / 'nested' / 'out.git'
         remote = BareGitOutputRemote(str(bare))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
 
         assert (bare / 'HEAD').exists()
@@ -87,14 +131,14 @@ class TestBareGitCreation:
         bare = tmp_path / 'out.git'
         _git('init', '--bare', str(bare))
         remote = BareGitOutputRemote(str(bare))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
         assert remote.annex_uuid() != ''
 
     def test_annex_init_is_idempotent(self, tmp_path):
         bare = tmp_path / 'out.git'
         remote = BareGitOutputRemote(str(bare))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
         first = remote.annex_uuid()
         remote._ensure_annex()
@@ -106,14 +150,14 @@ class TestBareGitCreation:
         empty = tmp_path / 'plain'
         empty.mkdir()
         remote = BareGitOutputRemote(str(empty))
-        remote._ensure_bare_repo()
-        assert remote._is_bare_repo()
+        remote._ensure_repo()
+        assert remote._existing_kind() == 'bare'
 
     def test_rejects_a_working_tree_repo(self, tmp_path):
         work = tmp_path / 'work'
         _git('init', str(work))
         with pytest.raises(ValueError, match='not a bare git repository'):
-            BareGitOutputRemote(str(work))._ensure_bare_repo()
+            BareGitOutputRemote(str(work))._ensure_repo()
 
 
 class TestPublicationContract:
@@ -209,7 +253,7 @@ class TestAnnexContentActuallyArrives:
     def test_content_lands_in_an_annex_initialized_bare_repo(self, tmp_path):
         bare = tmp_path / 'out.git'
         remote = BareGitOutputRemote(str(bare))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
 
         src = self._make_source(tmp_path)
@@ -247,7 +291,7 @@ class TestAnnexContentActuallyArrives:
         """One URL carries both channels, so there is nothing extra to address."""
         bare = tmp_path / 'out.git'
         remote = BareGitOutputRemote(str(bare))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
 
         src = self._make_source(tmp_path)
@@ -273,14 +317,14 @@ class TestProvisioningGuards:
         target.mkdir()
         (target / 'paper.txt').write_text('important')
         with pytest.raises(ValueError, match='not empty'):
-            BareGitOutputRemote(str(target))._ensure_bare_repo()
+            BareGitOutputRemote(str(target))._ensure_repo()
         assert sorted(os.listdir(target)) == ['paper.txt']
 
     def test_existing_empty_directory_is_initialised(self, tmp_path):
         target = tmp_path / 'out.git'
         target.mkdir()
         remote = BareGitOutputRemote(str(target))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
         assert remote.annex_uuid()
 
@@ -292,7 +336,7 @@ class TestProvisioningGuards:
         """scp-style URLs have no scheme, so a naive check treats them as paths
         and would `git init --bare` a local directory named `git@host:out.git`
         while every job pushes over ssh to a host that was never annex-inited."""
-        with pytest.raises(ValueError, match='local path'):
+        with pytest.raises(ValueError, match='filesystem|relative path'):
             BareGitOutputRemote(url)
 
 
@@ -319,7 +363,7 @@ class TestSharedGroupAndHead:
 
         monkeypatch.setattr(subprocess, 'run', spy)
         remote = BareGitOutputRemote(str(tmp_path / 'out.git'))
-        remote._ensure_bare_repo('group', 'mylab')
+        remote._ensure_repo('group', 'mylab')
         assert seen == [['chgrp', '-R', 'mylab', str(tmp_path / 'out.git')]]
 
     def test_finalize_points_head_at_the_published_branch(self, tmp_path):
@@ -402,7 +446,7 @@ class TestRejectedUrlsExplainTheRule:
         target = tmp_path / 'notes.txt'
         target.write_text('data')
         with pytest.raises(ValueError, match='is a file, not a directory'):
-            BareGitOutputRemote(str(target))._ensure_bare_repo()
+            BareGitOutputRemote(str(target))._ensure_repo()
 
 
 class TestAnnexIgnoreIsReadNotForced:
@@ -424,7 +468,7 @@ class TestAnnexIgnoreIsReadNotForced:
     @staticmethod
     def _annexed_remote(tmp_path):
         remote = BareGitOutputRemote(str(tmp_path / 'out.git'))
-        remote._ensure_bare_repo()
+        remote._ensure_repo()
         remote._ensure_annex()
         return remote
 
@@ -455,7 +499,7 @@ class TestAnnexIgnoreIsReadNotForced:
         analysis = self._analysis(tmp_path)
         _git('config', 'remote.output.annex-ignore', 'true', cwd=analysis)
         plain = BareGitOutputRemote(str(tmp_path / 'plain.git'))
-        plain._ensure_bare_repo()  # deliberately *not* annex-inited
+        plain._ensure_repo()  # deliberately *not* annex-inited
         with pytest.raises(ValueError, match='annex-ignore'):
             plain._clear_stale_annex_ignore(str(analysis))
         # and the flag git-annex set is left as it was
@@ -477,3 +521,104 @@ class TestContentRemoteNaming:
         # of the repository itself, so there it is `origin`
         assert remote.analysis_content_remote == 'output'
         assert remote.merge_content_remote == 'origin'
+
+
+class TestWorktreeGitProvider:
+    """A receiver with a checked-out branch, which normally refuses pushes."""
+
+    def test_creates_a_repo_that_accepts_pushes_into_its_checkout(self, tmp_path):
+        target = tmp_path / 'out'
+        remote = WorktreeGitOutputRemote(str(target))
+        remote._ensure_repo()
+        assert _git('rev-parse', '--is-bare-repository', cwd=target) == 'false'
+        assert _git('config', '--get', 'receive.denyCurrentBranch', cwd=target) == 'updateInstead'
+        assert _git('config', '--get', 'receive.denyNonFastforwards', cwd=target) == 'true'
+
+    def test_configures_a_pre_existing_repo_rather_than_refusing_it(self, tmp_path):
+        target = tmp_path / 'out'
+        target.mkdir()
+        _git('init', '-q', cwd=target)
+        WorktreeGitOutputRemote(str(target))._ensure_repo()
+        assert _git('config', '--get', 'receive.denyCurrentBranch', cwd=target) == 'updateInstead'
+
+    def test_refuses_an_existing_bare_repo(self, tmp_path):
+        """The value said 'a repository with a worktree'; what is there is not."""
+        target = tmp_path / 'out'
+        _git('init', '--bare', '-q', str(target))
+        with pytest.raises(ValueError, match='existing bare repository'):
+            WorktreeGitOutputRemote(str(target))._ensure_repo()
+
+    def test_a_push_updates_the_worktree(self, tmp_path):
+        """What this provider is for: results readable in place, not only
+        through a clone. Measured rather than assumed, since `updateInstead`
+        is the only reason a push into a checked-out branch is accepted."""
+        receiver = tmp_path / 'out'
+        remote = WorktreeGitOutputRemote(str(receiver))
+        remote._ensure_repo()
+        remote._ensure_annex()
+
+        src = tmp_path / 'src'
+        src.mkdir()
+        _git('init', '-q', '-b', 'main', cwd=src)
+        subprocess.run(['git', 'annex', 'init', '-q', 'src'], cwd=src, check=True)
+        (src / 'result.bin').write_bytes(b'payload')
+        subprocess.run(['git', 'annex', 'add', '-q', 'result.bin'], cwd=src, check=True)
+        _git('-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-q', '-m', 'r', cwd=src)
+        _git('remote', 'add', 'out', str(receiver), cwd=src)
+        subprocess.run(
+            ['git', 'annex', 'copy', '--to', 'out', '--in', 'here', '.'],
+            cwd=src,
+            capture_output=True,
+            check=True,
+        )
+        # the receiver's checked-out branch is unborn, then becomes `main`
+        _git('push', 'out', 'HEAD:main', cwd=src)
+        _git('symbolic-ref', 'HEAD', 'refs/heads/main', cwd=receiver)
+        _git('checkout', '-f', 'main', cwd=receiver)
+        assert (receiver / 'result.bin').exists(), 'the worktree did not receive the push'
+        objects = [p for p in (receiver / '.git' / 'annex' / 'objects').rglob('*') if p.is_file()]
+        assert objects, 'annexed content did not reach the receiver'
+
+
+class TestRemoteGitProvider:
+    """An endpoint BABS validates instead of creating."""
+
+    @staticmethod
+    def _annexed_endpoint(tmp_path, name='remote.git'):
+        path = tmp_path / name
+        _git('init', '--bare', '-q', str(path))
+        subprocess.run(
+            ['git', 'annex', 'init', 'remote'], cwd=path, capture_output=True, check=True
+        )
+        return path
+
+    def test_accepts_an_endpoint_that_advertises_a_git_annex_branch(self, tmp_path):
+        remote = RemoteGitOutputRemote(str(self._annexed_endpoint(tmp_path)))
+        remote._validate_endpoint()  # must not raise
+        assert remote._annex_evidence()
+
+    def test_refuses_an_endpoint_without_an_annex(self, tmp_path):
+        """The silent failure this provider exists to prevent: a plain git
+        host takes the result branches and drops the content."""
+        plain = tmp_path / 'plain.git'
+        _git('init', '--bare', '-q', str(plain))
+        remote = RemoteGitOutputRemote(str(plain))
+        with pytest.raises(ValueError, match='git-annex'):
+            remote._validate_endpoint()
+        assert not remote._annex_evidence()
+
+    def test_refuses_an_endpoint_it_cannot_reach(self, tmp_path):
+        remote = RemoteGitOutputRemote(str(tmp_path / 'nothing-here.git'))
+        with pytest.raises(ValueError, match='cannot be reached'):
+            remote._validate_endpoint()
+
+    def test_nothing_is_created(self, tmp_path):
+        """BABS must never bring a remote endpoint into existence."""
+        missing = tmp_path / 'nothing-here.git'
+        with pytest.raises(ValueError, match='cannot be reached'):
+            RemoteGitOutputRemote(str(missing))._validate_endpoint()
+        assert not missing.exists()
+
+    def test_the_url_is_kept_verbatim(self):
+        for url in ('ssh://user@host:2222/srv/out.git', 'git@host:out.git'):
+            assert RemoteGitOutputRemote(url).url == url

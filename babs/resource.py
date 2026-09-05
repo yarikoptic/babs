@@ -19,6 +19,7 @@ directory ``babs init`` ran in).
 """
 
 import os.path as op
+import subprocess
 
 from datalad.support.network import RI, SSHRI
 
@@ -91,3 +92,43 @@ def why_not_usable(value):
             'than the directory `babs init` ran in.'
         )
     return 'it is not a usable local path.'
+
+
+def is_ria(value):
+    """Whether `value` addresses a RIA store (``ria+file://``, ``ria+ssh://``, ...)."""
+    ri = parse(value)
+    return bool(getattr(ri, 'scheme', '') or '') and ri.scheme.startswith(RIA_PREFIX)
+
+
+def is_file_url(value):
+    """Whether `value` was written as a ``file://`` URL rather than a bare path.
+
+    The distinction is what the user *asked for* when the target does not
+    exist yet: a bare path means a RIA store (BABS's historical default),
+    while ``file://`` names a plain git repository.
+    """
+    ri = parse(value)
+    return getattr(ri, 'scheme', None) == 'file'
+
+
+def existing_kind(path):
+    """What is already at `path`: ``'ria'``, ``'bare'``, ``'worktree'`` or None.
+
+    Asked of the target itself rather than inferred from its name, so that a
+    store whose directory does not follow any naming convention is still
+    recognised for what it is.
+    """
+    if not path or not op.isdir(path):
+        return None
+    if op.exists(op.join(path, 'ria-layout-version')):
+        return None if op.exists(op.join(path, '.git')) else 'ria'
+    proc = subprocess.run(
+        ['git', 'rev-parse', '--is-bare-repository'],
+        cwd=path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return 'bare' if proc.stdout.strip() == 'true' else 'worktree'
