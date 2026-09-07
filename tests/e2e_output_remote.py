@@ -17,6 +17,11 @@ It runs once per provider:
 * ``worktree-git`` -- ``babs init --output-remote file:///path/to/output``: a
                   regular repository with a worktree, receiving pushes through
                   ``receive.denyCurrentBranch=updateInstead``.
+* ``remote-git`` -- ``babs init --output-remote ssh://host/path/to/output.git``:
+                  an endpoint reached over a git transport, which BABS validates
+                  rather than creates. Requires an ssh host that can reach the
+                  path; pass ``--ssh-host`` (see ``--help``), which is expected
+                  to be a `Host` alias in the caller's ``~/.ssh/config``.
 
 The point of running both is that the second must work *and* the first must
 still work.
@@ -364,10 +369,16 @@ def check_two_phase_publication(analysis_path, babs_proj):
     print('  content push precedes the flock-serialized result-branch push')
 
 
-def check_content_reached_the_endpoint(babs_proj, provider):
-    """The annexed zips must be *in* the endpoint, not merely referenced."""
-    if provider in ('bare-git', 'worktree-git'):
-        repo = Path(babs_proj.output_git_url)
+def check_content_reached_the_endpoint(babs_proj, provider, endpoint=None):
+    """The annexed zips must be *in* the endpoint, not merely referenced.
+
+    `endpoint` is where the endpoint lives on this filesystem. For
+    `remote-git` the project knows it only as an ssh URL -- which is the point
+    of that provider -- but the test drives an ssh host that points back here,
+    so the objects can still be counted directly.
+    """
+    if provider in ('bare-git', 'worktree-git', 'remote-git'):
+        repo = Path(endpoint if endpoint is not None else babs_proj.output_git_url)
         # a repository with a worktree keeps its annex under `.git/`
         annex = repo / 'annex' if (repo / 'annex').is_dir() else repo / '.git' / 'annex'
         objects = list((annex / 'objects').rglob('*.zip'))
@@ -428,7 +439,9 @@ def check_fresh_clone_can_retrieve(babs_proj, clone_path):
 # ---------------------------------------------------------------------------
 # one full run
 # ---------------------------------------------------------------------------
-def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurrent=False):
+def run_provider(
+    provider, workdir, shim_dir, bids_path, container_path, concurrent=False, ssh_host=None
+):
     print('\n' + '=' * 78)
     print(f'== PROVIDER: {provider}')
     print('=' * 78)
@@ -457,9 +470,20 @@ def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurr
         '--queue',
         'slurm',
     ]
-    endpoints = {'bare-git': root / 'output.git', 'worktree-git': root / 'output'}
+    endpoints = {
+        'bare-git': root / 'output.git',
+        'worktree-git': root / 'output',
+        'remote-git': root / 'output.git',
+    }
     endpoint = endpoints.get(provider)
-    if endpoint is not None:
+    if provider == 'remote-git':
+        # BABS validates this one instead of creating it, so it has to exist
+        # and be a git-annex repository before `babs init` runs.
+        print(f'\n== Preparing the ssh endpoint {endpoint} (BABS will not create it)')
+        run(['git', 'init', '--bare', '-q', str(endpoint)])
+        run(['git', 'annex', 'init', 'e2e-endpoint'], cwd=endpoint)
+        init_cmd += ['--output-remote', f'ssh://{ssh_host}{endpoint}']
+    elif endpoint is not None:
         init_cmd += ['--output-remote', f'file://{endpoint}']
 
     print('\n== babs init')
@@ -480,11 +504,12 @@ def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurr
             '(so that "absent" unambiguously means "the default").',
         )
     else:
+        expected_url = f'ssh://{ssh_host}{endpoint}' if provider == 'remote-git' else str(endpoint)
         expect(
-            proj_config.get('output_remote') == {'type': provider, 'url': str(endpoint)},
+            proj_config.get('output_remote') == {'type': provider, 'url': expected_url},
             f'Unexpected output_remote in project config: {proj_config.get("output_remote")}',
         )
-        expect(endpoint.is_dir(), f'`babs init` did not create {endpoint}')
+        expect(endpoint.is_dir(), f'the output endpoint {endpoint} does not exist')
         if provider == 'worktree-git':
             for key, value in (
                 ('receive.denyNonFastforwards', 'true'),
@@ -535,7 +560,7 @@ def run_provider(provider, workdir, shim_dir, bids_path, container_path, concurr
     print('\n== After the jobs: both channels must have reached the endpoint')
     branches = check_result_branches(babs_proj, len(SUBJECTS))
     print(f'  result branches: {branches}')
-    check_content_reached_the_endpoint(babs_proj, provider)
+    check_content_reached_the_endpoint(babs_proj, provider, endpoint)
 
     print('\n== babs status')
     run([*BABS_CLI, 'status', str(project_root)])
@@ -567,9 +592,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--provider',
-        choices=['ria', 'bare-git', 'worktree-git', 'both'],
+        choices=['ria', 'bare-git', 'worktree-git', 'remote-git', 'both'],
         default='both',
         help='Which output remote(s) to exercise.',
+    )
+    parser.add_argument(
+        '--ssh-host',
+        help='ssh host (typically a `Host` alias from ~/.ssh/config) that can reach this '
+        'filesystem, enabling the `remote-git` provider. Without it that provider is '
+        'skipped, since it needs a real git transport.',
     )
     parser.add_argument('--workdir', help='Directory to work in (a temp dir by default).')
     parser.add_argument('--keep', action='store_true', help='Do not delete the work directory.')
@@ -589,6 +620,13 @@ def main(argv=None):
     assert_using_this_tree()
 
     providers = ['ria', 'bare-git', 'worktree-git'] if args.provider == 'both' else [args.provider]
+    if args.provider == 'both' and args.ssh_host:
+        # only with an ssh host to point it at: it is the one provider that
+        # needs a real git transport rather than a path
+        providers.append('remote-git')
+    if 'remote-git' in providers and not args.ssh_host:
+        print('The `remote-git` provider needs --ssh-host; skipping it.', file=sys.stderr)
+        providers.remove('remote-git')
     try:
         shim_dir = write_shims(workdir / 'shims')
         bids_path = make_bids_dataset(workdir / 'ds000003-demo')
@@ -601,6 +639,7 @@ def main(argv=None):
                 bids_path,
                 container_path,
                 concurrent=args.concurrent,
+                ssh_host=args.ssh_host,
             )
     except E2EFailure as exc:
         print(f'\nE2E FAILED:\n{exc}', file=sys.stderr)
