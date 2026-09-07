@@ -683,15 +683,28 @@ rule, `RemoteGitOutputRemote` is validation and nothing else, ~40 and ~30 lines.
 The `annex-ignore` positive-evidence check generalised exactly as its docstring
 predicted: `annex.uuid` locally, the `git-annex` branch probe over a transport.
 
-**What is verified, and what is not.** All three local providers run end to end
-in `tests/e2e_output_remote.py --provider both`, and the worktree receiver is
-asserted to *show* the merged results in place — the reason that provider
-exists. The remote provider's validation is unit-tested against local
-repositories (accepts one advertising a `git-annex` branch, refuses one without,
-refuses an unreachable endpoint, creates nothing), but no test drives a real
-`ssh://` endpoint or a `ria+ssh://` store: there is no ssh server in the
-development container. The transport itself is therefore unexercised, and that
-is the first thing to cover when one is available.
+**What is verified.** All four providers run end to end in
+`tests/e2e_output_remote.py`, each through `babs init` → `check-setup` → two
+real participant jobs → `status` → `merge` → a fresh clone that retrieves the
+results. The worktree receiver is additionally asserted to *show* the merged
+results in place, which is the reason that provider exists.
+
+The remote provider is exercised over a **real git transport**, not simulated:
+`--ssh-host HOST` (a `Host` alias from the caller's ssh config) puts the whole
+cycle over ssh — validation at init, both jobs pushing content and their result
+branch, `babs merge` deleting the merged branches under the same OID lease, and
+a closing `datalad clone ssh://…`. Without `--ssh-host` that provider is
+skipped rather than faked with a path. Verified against a local `sshd`; a
+`ria+ssh://` store is still uncovered.
+
+**Where this could run.** `tests/e2e-slurm/` and `.circleci/config.yml` already
+describe a containerised Slurm setup (`pennlinc/slurm-docker-ci`), and running
+the suite inside that image is also what makes the `simbids` fixtures
+available. Note that `.github/workflows/e2e-slurm.yml` is not a usable starting
+point: besides being disabled (`branches-ignore: '**'`), it invokes
+`tests/e2e-slurm/install-babs.sh` and `main.sh`, neither of which exists any
+more. The ssh e2e above needs neither Slurm nor a container -- only an sshd,
+which stock CI runners have.
 
 ## Testing
 
