@@ -82,6 +82,13 @@ def run_sacct(queue, job_id: int) -> str:
         str(job_id),
         '--noheader',
         '--parsable2',
+        # Without this, sacct scales MaxRSS to whatever unit it deems
+        # readable (e.g. '500.91M' instead of '512932K'), which varies by
+        # value and can round away precision. `--units=K` pins it to a
+        # single unit (sacct has no plain-bytes option) so `_mem_to_bytes`
+        # parses it exactly; takes precedence over `--noconvert`, so there's
+        # no need for both.
+        '--units=K',
         '--format=JobID,MaxRSS,ElapsedRaw,ExitCode,State',
     ]
 

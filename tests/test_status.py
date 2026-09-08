@@ -539,13 +539,14 @@ class TestUpdateFromSacct:
         assert updated[('sub-01',)].max_rss == ''
         assert updated[('sub-01',)].exit_code == ''
 
-    def test_mem_comparison_across_units(self):
+    def test_mem_comparison_picks_larger_value(self):
+        # sacct is called with `--units=K`, so every MaxRSS reading is in KiB;
+        # the larger of the batch/extern/parent readings should be kept.
         statuses = self._submitted_statuses()
-        # 1G should be recognized as larger than 512932K
-        raw = '100_1|512932K|120|0:0|COMPLETED\n100_1.batch|1G||0:0|COMPLETED\n'
+        raw = '100_1|512932K|120|0:0|COMPLETED\n100_1.batch|1048576K||0:0|COMPLETED\n'
         updated = update_from_sacct(statuses, raw)
 
-        assert updated[('sub-01',)].max_rss == '1G'
+        assert updated[('sub-01',)].max_rss == '1048576K'
 
     def test_running_job_updates_snapshots_but_not_exit_code(self):
         # sacct reports ExitCode 0:0 while a job is still running, so recording it

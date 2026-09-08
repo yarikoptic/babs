@@ -383,8 +383,6 @@ def update_from_scheduler(
     return updated
 
 
-_MEM_UNIT_MULTIPLIERS = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
-
 # sacct ``State`` values after which a job's accounting no longer changes.
 _SACCT_TERMINAL_STATES = frozenset(
     {
@@ -403,18 +401,15 @@ _SACCT_TERMINAL_STATES = frozenset(
 
 
 def _mem_to_bytes(value: str) -> float:
-    """Convert a Slurm memory string (e.g. ``'512932K'``) to a byte count."""
+    """Convert a Slurm memory string in KiB (sacct's ``--units=K``, e.g. ``'512932K'``)
+    to a byte count."""
     value = value.strip()
     if not value:
         return 0.0
-    suffix = value[-1].upper()
-    if suffix in _MEM_UNIT_MULTIPLIERS:
-        try:
-            return float(value[:-1]) * _MEM_UNIT_MULTIPLIERS[suffix]
-        except ValueError:
-            return 0.0
+    if value[-1].upper() == 'K':
+        value = value[:-1]
     try:
-        return float(value)
+        return float(value) * 1024
     except ValueError:
         return 0.0
 
