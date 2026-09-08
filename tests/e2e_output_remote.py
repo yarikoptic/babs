@@ -353,7 +353,7 @@ def check_two_phase_publication(analysis_path, babs_proj):
     crash in between would advertise results whose content is nowhere.
     """
     script = (analysis_path / 'code' / 'participant_job.sh').read_text()
-    content_cmd = babs_proj.output_remote.job_content_push_command
+    content_cmd = f'git annex copy --to {babs_proj.output_remote.job_content_remote} --in here .'
     content_at = script.find(content_cmd)
     ref_at = script.find('git push outputstore')
     expect(content_at != -1, f'participant_job.sh does not run {content_cmd!r}')
@@ -504,9 +504,12 @@ def run_provider(
             '(so that "absent" unambiguously means "the default").',
         )
     else:
-        expected_url = f'ssh://{ssh_host}{endpoint}' if provider == 'remote-git' else str(endpoint)
+        expected_url = (
+            f'ssh://{ssh_host}{endpoint}' if provider == 'remote-git' else f'file://{endpoint}'
+        )
+        # Only the url is recorded: the provider is derived from it.
         expect(
-            proj_config.get('output_remote') == {'type': provider, 'url': expected_url},
+            proj_config.get('output_remote') == {'url': expected_url},
             f'Unexpected output_remote in project config: {proj_config.get("output_remote")}',
         )
         expect(endpoint.is_dir(), f'the output endpoint {endpoint} does not exist')

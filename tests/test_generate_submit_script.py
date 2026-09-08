@@ -330,7 +330,9 @@ _PUBLICATION_KWARGS = {
 #: them were rewritten to state the two-phase invariant where a reader of the
 #: generated script sees it; the *executable* text must not drift.
 _RIA_PUBLICATION_LINES = (
-    "echo '# Push result file content to output RIA storage:'\ndatalad push --to output-storage\n"
+    "echo '# Push result file content to the output remote:'\n"
+    '# `--in here` restricts the transfer to content this job actually has.\n'
+    'git annex copy --to output-storage --in here .\n'
 )
 
 
@@ -340,8 +342,15 @@ def _executable_lines(script):
     ]
 
 
-def test_default_publication_stanza_is_unchanged():
-    """The RIA default must render exactly as it did before providers existed."""
+def test_the_default_publishes_content_to_the_ora_sibling():
+    """The RIA default runs the same command as every other receiver.
+
+    It used to run `datalad push --to output-storage` here, kept verbatim so
+    the historical script was untouched. One command for all receivers is
+    worth more than that: `git annex copy --to` moves content to an ORA
+    special remote exactly as it does to a git remote, so the only thing the
+    provider supplies is the sibling name.
+    """
     script = generate_submit_script(**_PUBLICATION_KWARGS)
     assert _RIA_PUBLICATION_LINES in script
 
@@ -368,8 +377,8 @@ def test_bare_git_publishes_content_to_the_same_remote_as_the_branch(tmp_path):
     assert 'flock' in script[script.rindex('\n', 0, ref_at) : ref_at]
 
 
-def test_bare_git_differs_from_ria_only_in_the_content_push():
-    """The provider must change one command, not the shape of the job.
+def test_bare_git_differs_from_ria_only_in_the_sibling_name():
+    """The provider must change one name, not the shape of the job.
 
     Everything else about a participant job -- the clone, the run, the flocked
     result-ref push that marks completion -- is identical for both receivers.
@@ -384,9 +393,10 @@ def test_bare_git_differs_from_ria_only_in_the_content_push():
         )
     )
     differing = [(a, b) for a, b in zip(ria, bare, strict=True) if a != b]
-    # Exactly two: the progress `echo` (RIA keeps its historical wording) and
-    # the content-push command itself.
-    assert len(differing) == 2, differing
-    assert all(a.startswith('echo ') for a in differing[0])
-    assert differing[1][0] == 'datalad push --to output-storage'
-    assert differing[1][1].startswith('git annex copy --to outputstore')
+    # Exactly one line, and it differs only in the sibling name: the command
+    # itself is the same for every receiver.
+    assert len(differing) == 1, differing
+    assert differing[0] == (
+        'git annex copy --to output-storage --in here .',
+        'git annex copy --to outputstore --in here .',
+    )

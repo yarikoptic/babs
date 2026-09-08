@@ -27,8 +27,15 @@ from datalad.support.network import RI, SSHRI
 RIA_PREFIX = 'ria+'
 
 
-def parse(value):
-    """The `RI` for `value`, or ``None`` if datalad cannot parse it at all."""
+def _maybe_parse_ri(value: str | None) -> RI | None:
+    """The `RI` for `value`, or ``None`` when there is no resource to speak of.
+
+    ``None`` covers an empty value and one datalad cannot parse at all. Both
+    are answered by the public functions below as "this names no path" or,
+    where the caller needs a reason, by :func:`why_not_usable` -- so the
+    exception is turned into an answer here rather than swallowed: nothing
+    above this line has to handle `ValueError` from a *user-supplied string*.
+    """
     if not value:
         return None
     try:
@@ -37,7 +44,7 @@ def parse(value):
         return None
 
 
-def local_path(value):
+def local_path(value: str | None) -> str | None:
     """The filesystem path `value` names, or ``None`` when it names none.
 
     Understands plain paths, ``file://`` URLs and ``ria+file://`` stores. A
@@ -46,8 +53,7 @@ def local_path(value):
     plain path is just a character in a directory name, which is why this is
     asked of `RI` rather than done with a string split.
     """
-    ri = parse(value)
-    if ri is None:
+    if (ri := _maybe_parse_ri(value)) is None:
         return None
     scheme = getattr(ri, 'scheme', None) or ''
     if scheme.startswith(RIA_PREFIX):
@@ -59,7 +65,7 @@ def local_path(value):
         return None
 
 
-def usable_local_path(value):
+def usable_local_path(value: str | None) -> str | None:
     """The absolute path `value` names, or ``None`` if BABS cannot use it.
 
     ``~`` is expanded; see :func:`why_not_usable` for what is refused.
@@ -71,12 +77,11 @@ def usable_local_path(value):
     return op.abspath(path) if op.isabs(path) else None
 
 
-def why_not_usable(value):
+def why_not_usable(value: str | None) -> str:
     """One sentence naming the rule `value` broke, for an error message."""
     if not value:
         return 'it is empty.'
-    ri = parse(value)
-    if isinstance(ri, SSHRI):
+    if isinstance(_maybe_parse_ri(value), SSHRI):
         return "it is an ssh URL in git's scp-style syntax, not a filesystem path."
     path = local_path(value)
     if path is None:
@@ -94,24 +99,23 @@ def why_not_usable(value):
     return 'it is not a usable local path.'
 
 
-def is_ria(value):
+def is_ria(value: str | None) -> bool:
     """Whether `value` addresses a RIA store (``ria+file://``, ``ria+ssh://``, ...)."""
-    ri = parse(value)
-    return bool(getattr(ri, 'scheme', '') or '') and ri.scheme.startswith(RIA_PREFIX)
+    scheme = getattr(_maybe_parse_ri(value), 'scheme', None) or ''
+    return scheme.startswith(RIA_PREFIX)
 
 
-def is_file_url(value):
+def is_file_url(value: str | None) -> bool:
     """Whether `value` was written as a ``file://`` URL rather than a bare path.
 
     The distinction is what the user *asked for* when the target does not
     exist yet: a bare path means a RIA store (BABS's historical default),
     while ``file://`` names a plain git repository.
     """
-    ri = parse(value)
-    return getattr(ri, 'scheme', None) == 'file'
+    return getattr(_maybe_parse_ri(value), 'scheme', None) == 'file'
 
 
-def existing_kind(path):
+def existing_kind(path: str | None) -> str | None:
     """What is already at `path`: ``'ria'``, ``'bare'``, ``'worktree'`` or None.
 
     Asked of the target itself rather than inferred from its name, so that a

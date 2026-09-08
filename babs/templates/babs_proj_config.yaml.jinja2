@@ -21,8 +21,10 @@ container_images:
   - '{{ image_path }}'
 {% endfor %}{% if output_remote %}
 
-# where job results are published; absent means the in-project output RIA store
+# where job results are published; absent means the in-project output RIA store.
+# The url says which kind of receiver it is -- a `ria+` store, a `file://` git
+# repository (bare or with a worktree), or an endpoint reached over a git
+# transport -- so there is nothing else to record here.
 output_remote:
-  type: '{{ output_remote['type'] }}'
   url: '{{ output_remote['url'] }}'
 {% endif %}

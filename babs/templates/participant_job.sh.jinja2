@@ -190,9 +190,12 @@ datalad run \
 # Results are published in two phases. The file *content* goes first; the
 # result branch is pushed last, under flock, and is the completion marker that
 # `babs status` and `babs merge` read. Never reorder these: a result ref that
-# is visible must always imply content that is retrievable.
-echo '{{ content_push_echo }}'
-{{ content_push_command }}
+# is visible must always imply content that is retrievable. The phases are
+# also why this is not a single `datalad push`: only the ref push is
+# serialized, so content transfer stays parallel across the array.
+echo '# Push result file content to the output remote:'
+# `--in here` restricts the transfer to content this job actually has.
+git annex copy --to {{ content_remote }} --in here .
 
 # push the output branch:
 echo '# Push the branch with provenance records:'

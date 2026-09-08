@@ -706,6 +706,61 @@ point: besides being disabled (`branches-ignore: '**'`), it invokes
 more. The ssh e2e above needs neither Slurm nor a container -- only an sshd,
 which stock CI runners have.
 
+### Fourth round of review
+
+**One publication command, not one per receiver.** The job script used to run
+`datalad push --to output-storage` for RIA and `git annex copy --to
+outputstore` for a git receiver, with its own `echo` line each. Measured:
+`git annex copy --to` moves content to an *ORA special remote* exactly as it
+does to a git remote, so the RIA case needs no command of its own. The job now
+runs one line for every receiver and the provider supplies only a name:
+
+```
+git annex copy --to <sibling> --in here .
+```
+
+The cost, paid deliberately: the RIA `participant_job.sh` is no longer
+byte-for-byte what it was before this work. That property was a
+self-imposed conservatism, not a requirement, and one command shape is worth
+more than an unchanged file.
+
+**What the phases are, and why they are not one `datalad push`.** The split is
+not per receiver -- it is per *channel*, and it exists for concurrency:
+
+* `datalad push` already does the right *order*: `_push()` calls
+  `_transfer_data()` before `_push_refspecs()`, content before refs.
+* But the result-ref push is serialized with `flock`, because concurrent array
+  tasks race on ref and `git-annex` branch updates. A single `datalad push`
+  inside that lock would serialize the *content transfer* of every job in the
+  array -- the expensive part -- behind one lock.
+
+So the job pushes content unlocked and in parallel, then takes the lock only
+for the ref that marks completion. Uniform across receivers, and no cheaper as
+one command.
+
+**`branch.<name>.remote` cannot replace this.** Configuring the branch's push
+target once at `babs init` does not reach the jobs: each job is a *fresh
+`datalad clone`*, and git config is not part of what a clone carries, so the
+job script configures its remote itself (`git remote add outputstore …`) --
+that *is* the "configure once" step, executed per clone because there is a new
+clone each time. The result branch is created inside the job too, so nothing
+about it can be configured earlier.
+
+**The recorded config carries the url alone.** Which provider a project uses
+is derivable from the url, so recording a `type` beside it was a second source
+of truth that could disagree with the first. `babs_proj_config.yaml` now
+records `output_remote: {url: …}`, and re-reading dispatches exactly as
+`babs init` did. Local git providers record the `file://` form, since a bare
+path would re-read as a RIA store. A hand-written `type` that contradicts the
+url is refused rather than ignored.
+
+**Types and a checker.** `babs/resource.py`, `git_endpoint.py` and
+`output_remote.py` are fully annotated and checked by `mypy --strict` (a
+`[tool.mypy]` section limited to those three files, plus a `tox -e mypy`
+environment). Modules they import are followed for types but not reported on,
+so this is a gate on the new code rather than an invitation to annotate the
+whole tree at once.
+
 ## Testing
 
 - **Unit** — the endpoint helpers are pure git plumbing over a URL, tested

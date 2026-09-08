@@ -20,6 +20,16 @@ from babs.output_remote import (
 )
 
 
+def _copy_content_to(remote, cwd):
+    """Run the job's content push, exactly as `participant_job.sh` does."""
+    return subprocess.run(
+        ['git', 'annex', 'copy', '--to', remote.job_content_remote, '--in', 'here', '.'],
+        cwd=cwd,
+        capture_output=True,
+        check=True,
+    )
+
+
 def _git(*args, cwd=None, check=True):
     return subprocess.run(
         ['git', *args], cwd=cwd, capture_output=True, text=True, check=check
@@ -90,21 +100,27 @@ class TestSelection:
         value = value.format(tmp=str(tmp_path))
         remote = make_output_remote(str(tmp_path / 'output_ria'), value)
         cfg = remote.to_config()
-        assert cfg['type'] == expected_type
+        # only the url is recorded: which provider it means is derived from it
+        assert set(cfg) == {'url'}
         rebuilt = output_remote_from_config(str(tmp_path / 'output_ria'), cfg)
+        assert rebuilt.type == expected_type
         assert type(rebuilt) is type(remote)
         assert rebuilt.url == remote.url
 
     def test_ria_default_is_not_recorded_in_the_project_config(self, tmp_path):
         assert make_output_remote(str(tmp_path / 'output_ria')).to_config() is None
 
-    def test_unknown_type_is_rejected(self, tmp_path):
-        with pytest.raises(ValueError, match='Unknown'):
-            output_remote_from_config(str(tmp_path), {'type': 'sftp'})
-
-    def test_bare_git_without_url_is_rejected(self, tmp_path):
+    def test_a_config_without_a_url_is_rejected(self, tmp_path):
         with pytest.raises(ValueError, match='url'):
-            output_remote_from_config(str(tmp_path), {'type': 'bare-git'})
+            output_remote_from_config(str(tmp_path), {'note': 'no url here'})
+
+    def test_a_hand_written_type_that_contradicts_the_url_is_rejected(self, tmp_path):
+        """`type` is no longer written, being derivable; one that disagrees
+        with the url is a mistake worth naming rather than ignoring."""
+        with pytest.raises(ValueError, match='derived from the url'):
+            output_remote_from_config(
+                str(tmp_path), {'type': 'bare-git', 'url': f'ria+file://{tmp_path}/store'}
+            )
 
     def test_a_managed_provider_still_refuses_a_url(self):
         """The local providers create and annex-init a repository, which they
@@ -163,25 +179,19 @@ class TestBareGitCreation:
 class TestPublicationContract:
     """Both channels must reach the endpoint, and refs must go last."""
 
-    def test_ria_job_stanza_is_the_historical_text(self, tmp_path):
-        remote = RiaOutputRemote(str(tmp_path / 'output_ria'))
-        assert remote.job_content_push_echo == '# Push result file content to output RIA storage:'
-        assert remote.job_content_push_command == 'datalad push --to output-storage'
-        assert remote.merge_content_remote == 'output-storage'
+    def test_only_the_sibling_name_differs_between_receivers(self, tmp_path):
+        """The job runs one command shape whatever the receiver is; what the
+        provider supplies is a name, not a different command."""
+        ria = RiaOutputRemote(str(tmp_path / 'output_ria'))
+        # the ORA remote is auto-enabled, so a job clone resolves it by name
+        assert ria.job_content_remote == 'output-storage'
+        assert ria.merge_content_remote == 'output-storage'
 
-    def test_bare_git_content_push_targets_the_same_remote_as_the_ref_push(self, tmp_path):
-        remote = BareGitOutputRemote(str(tmp_path / 'out.git'))
-        command = remote.job_content_push_command
+        bare = BareGitOutputRemote(str(tmp_path / 'out.git'))
         # `outputstore` is the git remote participant_job.sh adds for
         # `${pushgitremote}`: one endpoint, both channels.
-        assert 'outputstore' in command
-        assert remote.merge_content_remote == 'origin'
-
-    def test_bare_git_content_push_moves_no_refs(self, tmp_path):
-        """Phase one must not publish the result branch: that is the marker."""
-        command = BareGitOutputRemote(str(tmp_path / 'out.git')).job_content_push_command
-        assert command.startswith('git annex copy')
-        assert 'git push' not in command
+        assert bare.job_content_remote == 'outputstore'
+        assert bare.merge_content_remote == 'origin'
 
     def test_ria_clone_source_keeps_the_dataset_id_fragment(self, tmp_path):
         remote = RiaOutputRemote(str(tmp_path / 'output_ria'))
@@ -258,13 +268,7 @@ class TestAnnexContentActuallyArrives:
 
         src = self._make_source(tmp_path)
         _git('remote', 'add', 'outputstore', str(bare), cwd=src)
-        subprocess.run(
-            remote.job_content_push_command,
-            cwd=src,
-            shell=True,
-            capture_output=True,
-            check=True,
-        )
+        _copy_content_to(remote, src)
         objects = list((bare / 'annex' / 'objects').rglob('*.zip'))
         assert objects, 'annexed content did not reach the bare repository'
 
@@ -297,9 +301,7 @@ class TestAnnexContentActuallyArrives:
         src = self._make_source(tmp_path)
         _git('checkout', '-b', 'job-1-1-sub-01', cwd=src)
         _git('remote', 'add', 'outputstore', str(bare), cwd=src)
-        subprocess.run(
-            remote.job_content_push_command, cwd=src, shell=True, capture_output=True, check=True
-        )
+        _copy_content_to(remote, src)
         # Content is there, but no result branch yet: the job is not "done".
         assert list((bare / 'annex' / 'objects').rglob('*.zip'))
         assert list_result_branches(str(bare)) == {}

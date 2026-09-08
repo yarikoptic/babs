@@ -16,6 +16,7 @@ job has finished" and ``babs merge`` refuse to merge results that exist.
 """
 
 import subprocess
+from collections.abc import Sequence
 
 #: Job result branches are published under this prefix.
 RESULTS_BRANCH_PREFIX = 'job-'
@@ -34,7 +35,9 @@ class GitEndpointError(RuntimeError):
     """
 
 
-def _run_git(args, what, timeout=DEFAULT_TIMEOUT, cwd=None):
+def _run_git(
+    args: Sequence[str], what: str, timeout: int = DEFAULT_TIMEOUT, cwd: str | None = None
+) -> str:
     """Run a git command, raising :class:`GitEndpointError` on any failure.
 
     ``cwd`` matters for one command in particular: ``git push`` refuses to run
@@ -66,7 +69,7 @@ def _run_git(args, what, timeout=DEFAULT_TIMEOUT, cwd=None):
     return proc.stdout
 
 
-def ls_remote_heads(url, timeout=DEFAULT_TIMEOUT):
+def ls_remote_heads(url: str, timeout: int = DEFAULT_TIMEOUT) -> dict[str, str]:
     """List all branches of a git endpoint.
 
     Parameters
@@ -102,7 +105,7 @@ def ls_remote_heads(url, timeout=DEFAULT_TIMEOUT):
     return heads
 
 
-def list_result_branches(url, timeout=DEFAULT_TIMEOUT):
+def list_result_branches(url: str, timeout: int = DEFAULT_TIMEOUT) -> dict[str, str]:
     """Return the ``job-*`` result branches of a git endpoint as ``{name: oid}``.
 
     Raises
@@ -118,7 +121,7 @@ def list_result_branches(url, timeout=DEFAULT_TIMEOUT):
     }
 
 
-def endpoint_head_hash(url, timeout=DEFAULT_TIMEOUT):
+def endpoint_head_hash(url: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Return the commit hash that ``HEAD`` resolves to at a git endpoint.
 
     This is the endpoint equivalent of ``git rev-parse HEAD`` with ``cwd=``.
@@ -140,7 +143,7 @@ def endpoint_head_hash(url, timeout=DEFAULT_TIMEOUT):
     raise GitEndpointError(f"The git endpoint '{url}' has no HEAD (is it empty?).")
 
 
-def endpoint_exists(url, timeout=DEFAULT_TIMEOUT):
+def endpoint_exists(url: str, timeout: int = DEFAULT_TIMEOUT) -> bool:
     """Return whether a git endpoint is reachable and looks like a repository."""
     try:
         _run_git(
@@ -153,7 +156,12 @@ def endpoint_exists(url, timeout=DEFAULT_TIMEOUT):
     return True
 
 
-def delete_result_branches(url, branch_oids, timeout=DEFAULT_TIMEOUT, cwd=None):
+def delete_result_branches(
+    url: str,
+    branch_oids: dict[str, str],
+    timeout: int = DEFAULT_TIMEOUT,
+    cwd: str | None = None,
+) -> str:
     """Delete branches at a git endpoint, guarded by an expected-OID lease.
 
     Each branch is only deleted if the endpoint still has it at exactly the

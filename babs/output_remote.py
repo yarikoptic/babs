@@ -15,20 +15,24 @@ endpoints: a bare git repository inside the store for the refs, and an ORA
 special remote (recorded in the ``git-annex`` branch with ``autoenable=true``)
 for the content.
 
-This module keeps that default byte-for-byte intact and adds a second
-provider, in which a **plain bare git repository** carries both channels over
-a single URL.  For annexed content to actually arrive in a plain bare
-repository, the repository must itself be a git-annex repository -- a bare
-repo that has never had ``git annex init`` run in it has no ``annex.uuid``,
-so ``datalad push`` reports ``copy (notneeded)`` and silently transfers
-nothing.  :meth:`BareGitOutputRemote.create_sibling` guarantees this.
+Both channels are published the same way whatever the receiver is: the
+content with ``git annex copy --to <sibling>``, then the result branch with
+``git push``, under ``flock``. Only the sibling *name* differs between
+receivers, and that is configuration rather than a different command.
+
+For annexed content to actually arrive, the receiver must itself be a
+git-annex repository: one that has never had ``git annex init`` run in it has
+no ``annex.uuid``, so ``datalad push`` reports ``copy (notneeded)`` and
+silently transfers nothing. The local providers guarantee that by initializing
+it; :class:`RemoteGitOutputRemote` validates it instead.
 """
 
 import os
 import os.path as op
 import subprocess
 import warnings
-from typing import ClassVar
+from collections.abc import Sequence
+from typing import Any, ClassVar
 
 from babs import resource
 from babs.git_endpoint import GitEndpointError, ls_remote_heads
@@ -38,13 +42,6 @@ GIT_SIBLING_NAME = 'output'
 
 #: Name that ``participant_job.sh`` gives the result git remote inside a job.
 JOB_GIT_REMOTE_NAME = 'outputstore'
-
-#: What ``participant_job.sh`` echoes/runs to publish content in a RIA project.
-#: These strings reproduce the pre-existing template text exactly, so that the
-#: default (RIA) ``participant_job.sh`` is unchanged.
-RIA_CONTENT_PUSH_COMMENT = '# push result file content to output RIA storage:'
-RIA_CONTENT_PUSH_ECHO = '# Push result file content to output RIA storage:'
-RIA_CONTENT_PUSH_COMMAND = 'datalad push --to output-storage'
 
 #: Name of the ORA special remote created by ``datalad create-sibling-ria``.
 RIA_CONTENT_SIBLING = 'output-storage'
@@ -57,7 +54,7 @@ _ANNEX_BRANCH_NAME = 'git-annex'
 _ANNEX_BRANCH = 'refs/heads/' + _ANNEX_BRANCH_NAME
 
 
-def _run_git_ok(args):
+def _run_git_ok(args: Sequence[str]) -> str:
     """Run git, returning stripped stdout, or '' on any failure."""
     proc = subprocess.run(args, capture_output=True, text=True, check=False)
     return proc.stdout.strip() if proc.returncode == 0 else ''
@@ -66,33 +63,34 @@ def _run_git_ok(args):
 class OutputRemote:
     """Base class: the place a BABS project publishes job results to."""
 
-    #: Value recorded under ``output_remote.type`` in ``babs_proj_config.yaml``.
-    type = None
+    #: Short name of the kind of receiver, for messages and tests. It is not
+    #: recorded in the project config: the URL says which provider it is.
+    type: ClassVar[str] = ''
 
-    def __init__(self, url):
+    def __init__(self, url: str) -> None:
         self.url = str(url)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f'{type(self).__name__}({self.url!r})'
 
     # ------------------------------------------------------------------
     # `babs init`
     # ------------------------------------------------------------------
-    def create_sibling(self, dataset, sibling_kwargs):
+    def create_sibling(self, dataset: Any, sibling_kwargs: dict[str, Any]) -> None:
         """Create the ``output`` sibling (and its content channel) of `dataset`."""
         raise NotImplementedError
 
-    def finalize(self, git_endpoint):
+    def finalize(self, git_endpoint: str) -> None:
         """Run any post-``datalad push`` setup.  `git_endpoint` is the git URL."""
 
     # ------------------------------------------------------------------
     # addressing
     # ------------------------------------------------------------------
-    def resolve_git_endpoint(self, recorded_push_url):
+    def resolve_git_endpoint(self, recorded_push_url: str) -> str:
         """Turn the recorded ``output`` push URL into the git endpoint to use."""
         return recorded_push_url
 
-    def clone_source(self, git_endpoint, analysis_dataset_id):
+    def clone_source(self, git_endpoint: str, analysis_dataset_id: str) -> str:
         """Return what ``datalad clone`` should be given to obtain the results."""
         raise NotImplementedError
 
@@ -100,36 +98,41 @@ class OutputRemote:
     # names/commands baked into generated code
     # ------------------------------------------------------------------
     @property
-    def job_content_push_echo(self):
-        """The ``echo`` line preceding the content push in ``participant_job.sh``."""
+    def job_content_remote(self) -> str:
+        """Name of the git-annex remote a *job* pushes result content to."""
         raise NotImplementedError
 
     @property
-    def job_content_push_command(self):
-        """The shell command that publishes annexed content from a job."""
-        raise NotImplementedError
-
-    @property
-    def merge_content_remote(self):
+    def merge_content_remote(self) -> str:
         """Name of the git-annex remote holding content, as seen from ``merge_ds``."""
         raise NotImplementedError
 
     @property
-    def analysis_content_remote(self):
+    def analysis_content_remote(self) -> str:
         """Name of the git-annex remote holding content, as seen from ``analysis``."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------
     # persistence
     # ------------------------------------------------------------------
-    def to_config(self):
+    @property
+    def config_url(self) -> str:
+        """The value to record, which must select this provider when re-read.
+
+        Only the URL is stored: which provider it means is derivable from it,
+        so recording a `type` beside it would be a second source of truth that
+        can disagree with the first.
+        """
+        return self.url
+
+    def to_config(self) -> dict[str, str] | None:
         """Return the ``output_remote`` mapping for ``babs_proj_config.yaml``.
 
         ``None`` means "do not record anything", which keeps the default
         project config identical to what BABS wrote before this feature and
         makes "key absent" unambiguously mean "the RIA default".
         """
-        return
+        return None
 
 
 class RiaOutputRemote(OutputRemote):
@@ -143,7 +146,7 @@ class RiaOutputRemote(OutputRemote):
 
     type = 'ria'
 
-    def __init__(self, store, in_project=False):
+    def __init__(self, store: str, in_project: bool = False) -> None:
         store = str(store)
         #: The in-project default is not recorded in the project config, so
         #: that "no `output_remote` section" keeps meaning exactly that.
@@ -161,7 +164,7 @@ class RiaOutputRemote(OutputRemote):
             url = 'ria+file://' + path
         super().__init__(url)
 
-    def create_sibling(self, dataset, sibling_kwargs):
+    def create_sibling(self, dataset: Any, sibling_kwargs: dict[str, Any]) -> None:
         if self.store_path is None:
             # The `alias/data` symlink `finalize` writes for a local store has
             # to be created by datalad, over the same transport it uses to
@@ -174,10 +177,10 @@ class RiaOutputRemote(OutputRemote):
             **sibling_kwargs,
         )
 
-    def to_config(self):
-        return None if self.in_project else {'type': self.type, 'url': self.url}
+    def to_config(self) -> dict[str, str] | None:
+        return None if self.in_project else {'url': self.config_url}
 
-    def resolve_git_endpoint(self, recorded_push_url):
+    def resolve_git_endpoint(self, recorded_push_url: str) -> str:
         # If the recorded URL points at the RIA store root rather than at the
         # dataset directory (no `.git` there), resolve it through the
         # `alias/data` symlink, e.g. output_ria/alias/data -> XX/xxx-uuid.
@@ -189,7 +192,7 @@ class RiaOutputRemote(OutputRemote):
                 return op.realpath(alias_link)
         return recorded_push_url
 
-    def finalize(self, git_endpoint):
+    def finalize(self, git_endpoint: str) -> None:
         """Add the ``alias/data`` symlink into the output RIA store."""
         if self.store_path is None:
             return  # created by datalad at `create_sibling` time
@@ -203,23 +206,21 @@ class RiaOutputRemote(OutputRemote):
             os.remove(the_symlink)
         os.symlink(git_endpoint, the_symlink)
 
-    def clone_source(self, git_endpoint, analysis_dataset_id):
+    def clone_source(self, git_endpoint: str, analysis_dataset_id: str) -> str:
         return self.url + '#' + analysis_dataset_id
 
     @property
-    def job_content_push_echo(self):
-        return RIA_CONTENT_PUSH_ECHO
-
-    @property
-    def job_content_push_command(self):
-        return RIA_CONTENT_PUSH_COMMAND
-
-    @property
-    def merge_content_remote(self):
+    def job_content_remote(self) -> str:
+        # The ORA special remote is auto-enabled from the git-annex branch, so
+        # a job clone resolves it by this name without configuring anything.
         return RIA_CONTENT_SIBLING
 
     @property
-    def analysis_content_remote(self):
+    def merge_content_remote(self) -> str:
+        return RIA_CONTENT_SIBLING
+
+    @property
+    def analysis_content_remote(self) -> str:
         # The ORA remote is auto-enabled from the git-annex branch, so it
         # carries the same name in every clone.
         return RIA_CONTENT_SIBLING
@@ -236,11 +237,11 @@ class GitOutputRemote(OutputRemote):
     """
 
     # ---------------- `babs init` ----------------
-    def _annex_evidence(self):
+    def _annex_evidence(self) -> bool:
         """Positive evidence that the endpoint really is a git-annex repository."""
         raise NotImplementedError
 
-    def _clear_stale_annex_ignore(self, dataset_path):
+    def _clear_stale_annex_ignore(self, dataset_path: str) -> None:
         """Clear `annex-ignore` only when the endpoint provably *is* an annex.
 
         git-annex sets ``remote.<name>.annex-ignore=true`` when its probe could
@@ -290,44 +291,39 @@ class GitOutputRemote(OutputRemote):
         )
 
     # ---------------- addressing ----------------
-    def finalize(self, git_endpoint):
+    def finalize(self, git_endpoint: str) -> None:
         """Nothing to do: a repository with a worktree already has a `HEAD`."""
 
-    def clone_source(self, git_endpoint, analysis_dataset_id):
+    def clone_source(self, git_endpoint: str, analysis_dataset_id: str) -> str:
         return git_endpoint
 
     # ---------------- generated code ----------------
     @property
-    def job_content_push_echo(self):
-        return '# Push result file content to the output remote:'
+    def job_content_remote(self) -> str:
+        # One sibling carries both channels, so content goes to the same
+        # remote the job script adds for the result branch.
+        return JOB_GIT_REMOTE_NAME
 
     @property
-    def job_content_push_command(self):
-        # Content only: the result branch is pushed separately, and last, so
-        # that a visible result branch always implies retrievable content.
-        # `--in here` restricts the transfer to content this job actually has.
-        return f'git annex copy --to {JOB_GIT_REMOTE_NAME} --in here .'
-
-    @property
-    def merge_content_remote(self):
+    def merge_content_remote(self) -> str:
         # `merge_ds` is a plain clone of the repository, so the remote that
         # holds the content is `origin` itself.
         return 'origin'
 
     @property
-    def analysis_content_remote(self):
+    def analysis_content_remote(self) -> str:
         # One sibling carries both channels here, so content lives on the
         # same remote as the refs.
         return GIT_SIBLING_NAME
 
-    def to_config(self):
-        return {'type': self.type, 'url': self.url}
+    def to_config(self) -> dict[str, str] | None:
+        return {'url': self.config_url}
 
 
 class LocalGitOutputRemote(GitOutputRemote):
     """A repository on this filesystem, which BABS creates and manages."""
 
-    def __init__(self, url):
+    def __init__(self, url: str) -> None:
         super().__init__(url)
         repo_path = resource.usable_local_path(self.url)
         if repo_path is None:
@@ -337,17 +333,23 @@ class LocalGitOutputRemote(GitOutputRemote):
         self.repo_path = repo_path
         self.url = self.repo_path
 
-    def create_sibling(self, dataset, sibling_kwargs):
+    def create_sibling(self, dataset: Any, sibling_kwargs: dict[str, Any]) -> None:
         self._ensure_repo(sibling_kwargs.get('shared'), sibling_kwargs.get('group'))
         self._ensure_annex()
         dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.repo_path)
         self._clear_stale_annex_ignore(dataset.path)
 
-    def _ensure_repo(self, shared=None, group=None):
+    @property
+    def config_url(self) -> str:
+        # `self.url` is the plain path here, which on re-reading would mean a
+        # RIA store; `file://` is what says "a git repository at this path".
+        return 'file://' + self.repo_path
+
+    def _ensure_repo(self, shared: str | None = None, group: str | None = None) -> None:
         """Create the repository if needed; validate it if it exists."""
         raise NotImplementedError
 
-    def _init_repo(self, extra_args, shared, group):
+    def _init_repo(self, extra_args: Sequence[str], shared: str | None, group: str | None) -> None:
         """`git init` the repository, then apply the shared-group ownership."""
         os.makedirs(op.dirname(self.repo_path), exist_ok=True)
         cmd = ['git', 'init', *extra_args]
@@ -374,7 +376,7 @@ class LocalGitOutputRemote(GitOutputRemote):
                     f"'{self.repo_path}': {proc.stderr.strip()}"
                 )
 
-    def _refuse_if_unusable_directory(self):
+    def _refuse_if_unusable_directory(self) -> None:
         """Common checks before anything shells out with ``cwd=repo_path``.
 
         `Popen` raises `NotADirectoryError` on a file, which would surface as
@@ -385,10 +387,10 @@ class LocalGitOutputRemote(GitOutputRemote):
                 f"'--output-remote {self.repo_path}' exists but is a file, not a directory."
             )
 
-    def _existing_kind(self):
+    def _existing_kind(self) -> str | None:
         return resource.existing_kind(self.repo_path)
 
-    def annex_uuid(self):
+    def annex_uuid(self) -> str:
         """Return the repository's ``annex.uuid``, or ``''`` if it has none."""
         proc = subprocess.run(
             ['git', 'config', '--get', 'annex.uuid'],
@@ -399,10 +401,10 @@ class LocalGitOutputRemote(GitOutputRemote):
         )
         return proc.stdout.strip() if proc.returncode == 0 else ''
 
-    def _annex_evidence(self):
+    def _annex_evidence(self) -> bool:
         return bool(self.annex_uuid())
 
-    def _ensure_annex(self):
+    def _ensure_annex(self) -> None:
         """Make the repository a git-annex repository.
 
         Without this, the repository has no ``annex.uuid``; git-annex then
@@ -431,7 +433,7 @@ class BareGitOutputRemote(LocalGitOutputRemote):
 
     type = 'bare-git'
 
-    def _ensure_repo(self, shared=None, group=None):
+    def _ensure_repo(self, shared: str | None = None, group: str | None = None) -> None:
         self._refuse_if_unusable_directory()
         if op.isdir(self.repo_path):
             kind = self._existing_kind()
@@ -451,7 +453,7 @@ class BareGitOutputRemote(LocalGitOutputRemote):
             # An existing empty directory is fine: initialise into it.
         self._init_repo(['--bare'], shared, group)
 
-    def finalize(self, git_endpoint):
+    def finalize(self, git_endpoint: str) -> None:
         """Point the bare repository's ``HEAD`` at the branch BABS publishes.
 
         ``git init --bare`` takes ``HEAD`` from the creating machine's
@@ -497,12 +499,12 @@ class WorktreeGitOutputRemote(LocalGitOutputRemote):
 
     #: Pushes into this repository must not rewrite history, and must update
     #: the worktree rather than being refused for touching a checked-out branch.
-    RECEIVE_CONFIG: ClassVar[dict] = {
+    RECEIVE_CONFIG: ClassVar[dict[str, str]] = {
         'receive.denyNonFastforwards': 'true',
         'receive.denyCurrentBranch': 'updateInstead',
     }
 
-    def _ensure_repo(self, shared=None, group=None):
+    def _ensure_repo(self, shared: str | None = None, group: str | None = None) -> None:
         self._refuse_if_unusable_directory()
         kind = self._existing_kind() if op.isdir(self.repo_path) else None
         if kind is None:
@@ -544,12 +546,12 @@ class RemoteGitOutputRemote(GitOutputRemote):
 
     type = 'remote-git'
 
-    def create_sibling(self, dataset, sibling_kwargs):
+    def create_sibling(self, dataset: Any, sibling_kwargs: dict[str, Any]) -> None:
         self._validate_endpoint()
         dataset.siblings(action='add', name=GIT_SIBLING_NAME, url=self.url)
         self._clear_stale_annex_ignore(dataset.path)
 
-    def _validate_endpoint(self):
+    def _validate_endpoint(self) -> None:
         try:
             heads = ls_remote_heads(self.url)
         except GitEndpointError as exc:
@@ -567,14 +569,14 @@ class RemoteGitOutputRemote(GitOutputRemote):
                 '(the host must support git-annex, e.g. forgejo-aneksajo or GIN).'
             )
 
-    def _annex_evidence(self):
+    def _annex_evidence(self) -> bool:
         try:
             return _ANNEX_BRANCH_NAME in ls_remote_heads(self.url)
         except GitEndpointError:
             return False
 
 
-def make_output_remote(output_ria_path, output_remote=None):
+def make_output_remote(output_ria_path: str, output_remote: str | None = None) -> OutputRemote:
     """Build the output remote provider for a BABS project.
 
     The value's shape says what kind of endpoint it is, and an existing target
@@ -624,18 +626,24 @@ def make_output_remote(output_ria_path, output_remote=None):
             kind = 'ria'
         else:
             kind = 'bare' if path.endswith('.git') else 'worktree'
-    return {
+    providers: dict[str, type[OutputRemote]] = {
         'ria': RiaOutputRemote,
         'bare': BareGitOutputRemote,
         'worktree': WorktreeGitOutputRemote,
-    }[kind](path)
+    }
+    return providers[kind](path)
 
 
-def output_remote_from_config(output_ria_path, config_section):
+def output_remote_from_config(
+    output_ria_path: str, config_section: dict[str, Any] | None
+) -> OutputRemote:
     """Rebuild the provider from ``babs_proj_config.yaml``.
 
     A project created before ``--output-remote`` existed has no
-    ``output_remote`` section; that is the RIA default.
+    ``output_remote`` section; that is the RIA default. Otherwise the section
+    carries a ``url``, and which provider it means is derived from it exactly
+    as it was at ``babs init`` -- there is no second, independently stored
+    answer that could disagree.
     """
     if not config_section:
         return RiaOutputRemote(output_ria_path, in_project=True)
@@ -644,24 +652,18 @@ def output_remote_from_config(output_ria_path, config_section):
             f"'output_remote' in babs_proj_config.yaml must be a mapping, "
             f'got {type(config_section).__name__}'
         )
-    remote_type = config_section.get('type', RiaOutputRemote.type)
-    providers = {
-        RiaOutputRemote.type: RiaOutputRemote,
-        BareGitOutputRemote.type: BareGitOutputRemote,
-        WorktreeGitOutputRemote.type: WorktreeGitOutputRemote,
-        RemoteGitOutputRemote.type: RemoteGitOutputRemote,
-    }
-    if remote_type not in providers:
-        raise ValueError(
-            f"Unknown 'output_remote.type' in babs_proj_config.yaml: {remote_type!r}. "
-            f'Known types: {", ".join(repr(name) for name in providers)}.'
-        )
     url = config_section.get('url')
     if not url:
-        if remote_type == RiaOutputRemote.type:
-            return RiaOutputRemote(output_ria_path, in_project=True)
+        raise ValueError("'output_remote' in babs_proj_config.yaml is missing its 'url'.")
+    remote = make_output_remote(output_ria_path, url)
+    # `type` is redundant, so it is no longer written -- but if a hand-edited
+    # config carries one, disagreeing with the URL is a mistake worth naming
+    # rather than silently ignoring.
+    recorded_type = config_section.get('type')
+    if recorded_type is not None and recorded_type != remote.type:
         raise ValueError(
-            f"'output_remote' of type {remote_type!r} in babs_proj_config.yaml "
-            "is missing its 'url'."
+            f"'output_remote' in babs_proj_config.yaml says type {recorded_type!r}, but its "
+            f"url {url!r} is a {remote.type!r} endpoint. Remove the 'type' key: it is "
+            'derived from the url.'
         )
-    return providers[remote_type](url)
+    return remote

@@ -6,7 +6,7 @@ from importlib import resources
 import yaml
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
-from babs.output_remote import RIA_CONTENT_PUSH_COMMAND, RIA_CONTENT_PUSH_ECHO
+from babs.output_remote import RIA_CONTENT_SIBLING
 from babs.utils import container_image_path, var_safe_name
 
 # Multiple scheduler system handling
@@ -139,22 +139,21 @@ def generate_submit_script(
         container_image_paths=container_image_paths,
         datalad_run_message=datalad_run_message,
         analysis_path=analysis_path,
-        content_push_echo=_content_push(output_remote)[0],
-        content_push_command=_content_push(output_remote)[1],
+        content_remote=_content_remote(output_remote),
     )
 
 
-def _content_push(output_remote):
-    """The echo/command pair that publishes annexed content from a job.
+def _content_remote(output_remote):
+    """Name of the git-annex remote a job pushes result content to.
 
     `None` means the default RIA receiver -- the same thing an absent
     `output_remote:` config section means for a pre-existing project. The
-    constants are used rather than an instance because the default needs no
+    constant is used rather than an instance because the default needs no
     store to answer this.
     """
     if output_remote is None:
-        return RIA_CONTENT_PUSH_ECHO, RIA_CONTENT_PUSH_COMMAND
-    return output_remote.job_content_push_echo, output_remote.job_content_push_command
+        return RIA_CONTENT_SIBLING
+    return output_remote.job_content_remote
 
 
 def generate_test_submit_script(
