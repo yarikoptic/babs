@@ -1,6 +1,7 @@
 import os.path as op
 import re
 import subprocess
+import warnings
 from io import StringIO
 
 import pandas as pd
@@ -50,6 +51,58 @@ def run_squeue(queue, job_id: int) -> str:
         raise RuntimeError(
             f'squeue failed with return code {result.returncode}\nstderr: {result.stderr}'
         )
+    return result.stdout
+
+
+def run_sacct(queue, job_id: int) -> str:
+    """Run sacct and return raw pipe-delimited accounting output.
+
+    Parameters
+    ----------
+    queue : str
+        Job scheduling system type (only 'slurm' supported).
+    job_id : int
+        The job array ID to query.
+
+    Returns
+    -------
+    str
+        Raw sacct stdout (pipe-delimited lines: JobID|MaxRSS|ElapsedRaw|
+        ExitCode|State), or empty string if no accounting records
+        are found or sacct fails (e.g. no accounting database on this cluster).
+    """
+    if queue != 'slurm':
+        raise NotImplementedError(f'Queue {queue!r} is not supported.')
+    if not check_slurm_available():
+        raise RuntimeError('Slurm commands are not available on this system.')
+
+    cmd = [
+        'sacct',
+        '-j',
+        str(job_id),
+        '--noheader',
+        '--parsable2',
+        # Without this, sacct scales MaxRSS to whatever unit it deems
+        # readable (e.g. '500.91M' instead of '512932K'), which varies by
+        # value and can round away precision. `--units=K` pins it to a
+        # single unit (sacct has no plain-bytes option) so `_mem_to_bytes`
+        # parses it exactly; takes precedence over `--noconvert`, so there's
+        # no need for both.
+        '--units=K',
+        '--format=JobID,MaxRSS,ElapsedRaw,ExitCode,State',
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    if result.returncode != 0:
+        # Accounting is additive: scheduler state still comes from squeue, so a
+        # cluster without a working sacct keeps a working `babs status`.
+        warnings.warn(
+            f'sacct failed with return code {result.returncode}; '
+            f'accounting metrics not updated.\nstderr: {result.stderr}',
+            stacklevel=2,
+        )
+        return ''
     return result.stdout
 
 
