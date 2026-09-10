@@ -738,13 +738,42 @@ So the job pushes content unlocked and in parallel, then takes the lock only
 for the ref that marks completion. Uniform across receivers, and no cheaper as
 one command.
 
-**`branch.<name>.remote` cannot replace this.** Configuring the branch's push
-target once at `babs init` does not reach the jobs: each job is a *fresh
-`datalad clone`*, and git config is not part of what a clone carries, so the
-job script configures its remote itself (`git remote add outputstore …`) --
-that *is* the "configure once" step, executed per clone because there is a new
-clone each time. The result branch is created inside the job too, so nothing
-about it can be configured earlier.
+**Where the push target is configured.** Not at `babs init`: each job is a
+*fresh `datalad clone`*, and git config is not part of what a clone carries, so
+nothing set when the project was created reaches a job. The job script is the
+place, and it already was -- `git remote add outputstore …` -- so the branch's
+target is now set right after the branch is created, and the ref push takes no
+arguments at all:
+
+```sh
+git checkout -b "${BRANCH}"
+git config "branch.${BRANCH}.remote" outputstore
+git config "branch.${BRANCH}.merge" "refs/heads/${BRANCH}"
+...
+flock "${DSLOCKFILE}" git push
+```
+
+Both config lines are needed, measured rather than assumed: with only
+`branch.<name>.remote`, a bare `git push` fails under the default
+`push.default=simple` (*"The current branch has no upstream branch"*, rc=128).
+With `.merge` as well it pushes exactly that one branch.
+
+**The lock is about the shared ref, not the branch.** Measured on this repo's
+own shape: 32 concurrent `git push` of *distinct* `job-*` branches into one
+bare repository → **0 failures**; 8 concurrent `datalad push` → **7 fail**,
+every one of them on `refs/heads/git-annex ... [rejected] (fetch first)`. So
+the write conflict the FAIRly big lock exists for (BABS commit `ba199a4`:
+*"this push needs a global lock to prevent write conflicts - FAIRly big
+paper"*) is the git-annex branch, which every job would update: `datalad push`
+pushes it, `git push <branch>` does not. Nothing hangs -- it is a rejection.
+
+Two consequences worth stating plainly. Publishing from a job with one
+`datalad push` does not merely serialize badly under the lock: without a lock
+it *fails* at 7-in-8 under 8-way concurrency, and BABS submits arrays of
+hundreds. And the flock as it now stands guards a push that measurably does
+not contend, so it is belt-and-braces rather than load-bearing -- kept because
+it costs microseconds and protects against a future where the job pushes
+something shared.
 
 **The recorded config carries the url alone.** Which provider a project uses
 is derivable from the url, so recording a `type` beside it was a second source

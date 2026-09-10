@@ -61,6 +61,13 @@ git remote add outputstore "${pushgitremote}"
 echo "# Create a new branch for this job's results:"
 git checkout -b "${BRANCH}"
 
+# Say where this branch publishes, so the push at the end needs no arguments.
+# This is the moment to do it: the job runs in a fresh clone, so no config set
+# when the project was created reaches here, and the branch itself only exists
+# from this line on.
+git config "branch.${BRANCH}.remote" outputstore
+git config "branch.${BRANCH}.merge" "refs/heads/${BRANCH}"
+
 # always use sparse-checkout, print error when not available
 if ! git sparse-checkout init --cone; then
     echo "ERROR: git sparse-checkout is not available (or failed to initialize) on this system." 1>&2
@@ -199,8 +206,9 @@ git annex copy --to {{ content_remote }} --in here .
 
 # push the output branch:
 echo '# Push the branch with provenance records:'
+# Where it goes was configured above, so this is a plain `git push`.
 # DSLOCKFILE set by sbatch --export= in container.py
 # shellcheck disable=SC2154
-flock "${DSLOCKFILE}" git push outputstore "${BRANCH}"
+flock "${DSLOCKFILE}" git push
 
 echo SUCCESS

@@ -371,10 +371,14 @@ def test_bare_git_publishes_content_to_the_same_remote_as_the_branch(tmp_path):
     )
     assert 'datalad push --to output-storage' not in script
     content_at = script.index('git annex copy --to outputstore')
-    ref_at = script.index('git push outputstore')
+    # The ref push is locked, and takes no arguments: where it goes was
+    # configured on the branch, so matching this string proves both.
+    ref_push = 'flock "${DSLOCKFILE}" git push'
+    ref_at = script.index(ref_push)
+    assert script[ref_at + len(ref_push)] == '\n', 'the ref push should take no arguments'
+    assert 'git config "branch.${BRANCH}.remote" outputstore' in script
     # Content first, the result branch (the completion marker) last.
     assert content_at < ref_at
-    assert 'flock' in script[script.rindex('\n', 0, ref_at) : ref_at]
 
 
 def test_bare_git_differs_from_ria_only_in_the_sibling_name():

@@ -355,7 +355,8 @@ def check_two_phase_publication(analysis_path, babs_proj):
     script = (analysis_path / 'code' / 'participant_job.sh').read_text()
     content_cmd = f'git annex copy --to {babs_proj.output_remote.job_content_remote} --in here .'
     content_at = script.find(content_cmd)
-    ref_at = script.find('git push outputstore')
+    ref_push = 'flock "${DSLOCKFILE}" git push'
+    ref_at = script.find(ref_push)
     expect(content_at != -1, f'participant_job.sh does not run {content_cmd!r}')
     expect(ref_at != -1, 'participant_job.sh does not push the result branch')
     expect(
@@ -363,8 +364,8 @@ def check_two_phase_publication(analysis_path, babs_proj):
         'participant_job.sh publishes the result branch before the content',
     )
     expect(
-        'flock' in script[script.rfind('\n', 0, ref_at) : ref_at],
-        'the result-branch push is not serialized with flock',
+        ref_at != -1 and script[ref_at + len(ref_push)] == '\n',
+        'the result-branch push is not a locked, argument-free `git push`',
     )
     print('  content push precedes the flock-serialized result-branch push')
 
