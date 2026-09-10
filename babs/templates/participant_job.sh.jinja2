@@ -61,6 +61,13 @@ git remote add outputstore "${pushgitremote}"
 echo "# Create a new branch for this job's results:"
 git checkout -b "${BRANCH}"
 
+# Say where this branch publishes, so the push at the end needs no arguments.
+# This is the moment to do it: the job runs in a fresh clone, so no config set
+# when the project was created reaches here, and the branch itself only exists
+# from this line on.
+git config "branch.${BRANCH}.remote" outputstore
+git config "branch.${BRANCH}.merge" "refs/heads/${BRANCH}"
+
 # always use sparse-checkout, print error when not available
 if ! git sparse-checkout init --cone; then
     echo "ERROR: git sparse-checkout is not available (or failed to initialize) on this system." 1>&2
@@ -187,14 +194,21 @@ datalad run \
     "bash ./{{ run_script_relpath if run_script_relpath else 'code/' + container_name + '_zip.sh' }} {% raw %}${subid}{% endraw %} {% if processing_level == 'session' %} {% raw %}${sesid}{% endraw %}{% endif %}{% for input_dataset in input_datasets %}{% if input_dataset['is_zipped'] %} ${%raw%}{{%endraw%}{{ input_dataset['name'] | shell_safe }}_ZIP{%raw%}}{%endraw%}{%endif%}{%endfor%}"
 
 # Finish up:
-# push result file content to output RIA storage:
-echo '# Push result file content to output RIA storage:'
-datalad push --to output-storage
+# Results are published in two phases. The file *content* goes first; the
+# result branch is pushed last, under flock, and is the completion marker that
+# `babs status` and `babs merge` read. Never reorder these: a result ref that
+# is visible must always imply content that is retrievable. The phases are
+# also why this is not a single `datalad push`: only the ref push is
+# serialized, so content transfer stays parallel across the array.
+echo '# Push result file content to the output remote:'
+# `--in here` restricts the transfer to content this job actually has.
+git annex copy --to {{ content_remote }} --in here .
 
 # push the output branch:
 echo '# Push the branch with provenance records:'
+# Where it goes was configured above, so this is a plain `git push`.
 # DSLOCKFILE set by sbatch --export= in container.py
 # shellcheck disable=SC2154
-flock "${DSLOCKFILE}" git push outputstore "${BRANCH}"
+flock "${DSLOCKFILE}" git push
 
 echo SUCCESS

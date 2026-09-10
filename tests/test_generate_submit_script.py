@@ -308,3 +308,99 @@ def test_find_single_zip_handles_regex_metachars_in_name(name, processing_level,
 
     assert result.returncode == 0, result.stderr
     assert zipname in result.stdout, f'zip not located:\nOUT:{result.stdout}\nERR:{result.stderr}'
+
+
+# ---------------------------------------------------------------------------
+# Result publication: which endpoint, and in which order.
+# ---------------------------------------------------------------------------
+_PUBLICATION_KWARGS = {
+    'queue_system': 'slurm',
+    'cluster_resources_config': {'interpreting_shell': '/bin/bash'},
+    'script_preamble': '',
+    'job_scratch_directory': '/tmp',
+    'input_datasets': input_datasets_prep,
+    'processing_level': 'subject',
+    'container_name': 'mriqc-24-0-2',
+    'zip_foldernames': {'mriqc': '24-0-2'},
+    'analysis_path': '/proj/analysis',
+}
+
+# What the script has always contained for the (default) output RIA store.
+#: The two executable lines the RIA default has always emitted. Comments around
+#: them were rewritten to state the two-phase invariant where a reader of the
+#: generated script sees it; the *executable* text must not drift.
+_RIA_PUBLICATION_LINES = (
+    "echo '# Push result file content to the output remote:'\n"
+    '# `--in here` restricts the transfer to content this job actually has.\n'
+    'git annex copy --to output-storage --in here .\n'
+)
+
+
+def _executable_lines(script):
+    return [
+        line for line in script.splitlines() if line.strip() and not line.lstrip().startswith('#')
+    ]
+
+
+def test_the_default_publishes_content_to_the_ora_sibling():
+    """The RIA default runs the same command as every other receiver.
+
+    It used to run `datalad push --to output-storage` here, kept verbatim so
+    the historical script was untouched. One command for all receivers is
+    worth more than that: `git annex copy --to` moves content to an ORA
+    special remote exactly as it does to a git remote, so the only thing the
+    provider supplies is the sibling name.
+    """
+    script = generate_submit_script(**_PUBLICATION_KWARGS)
+    assert _RIA_PUBLICATION_LINES in script
+
+
+def test_explicit_ria_provider_matches_the_default():
+    from babs.output_remote import RiaOutputRemote
+
+    assert generate_submit_script(**_PUBLICATION_KWARGS) == generate_submit_script(
+        output_remote=RiaOutputRemote('/proj/output_ria'), **_PUBLICATION_KWARGS
+    )
+
+
+def test_bare_git_publishes_content_to_the_same_remote_as_the_branch(tmp_path):
+    from babs.output_remote import BareGitOutputRemote
+
+    script = generate_submit_script(
+        output_remote=BareGitOutputRemote(str(tmp_path / 'out.git')), **_PUBLICATION_KWARGS
+    )
+    assert 'datalad push --to output-storage' not in script
+    content_at = script.index('git annex copy --to outputstore')
+    # The ref push is locked, and takes no arguments: where it goes was
+    # configured on the branch, so matching this string proves both.
+    ref_push = 'flock "${DSLOCKFILE}" git push'
+    ref_at = script.index(ref_push)
+    assert script[ref_at + len(ref_push)] == '\n', 'the ref push should take no arguments'
+    assert 'git config "branch.${BRANCH}.remote" outputstore' in script
+    # Content first, the result branch (the completion marker) last.
+    assert content_at < ref_at
+
+
+def test_bare_git_differs_from_ria_only_in_the_sibling_name():
+    """The provider must change one name, not the shape of the job.
+
+    Everything else about a participant job -- the clone, the run, the flocked
+    result-ref push that marks completion -- is identical for both receivers.
+    Anything else showing up in this diff is scope the provider should not have.
+    """
+    from babs.output_remote import BareGitOutputRemote
+
+    ria = _executable_lines(generate_submit_script(**_PUBLICATION_KWARGS))
+    bare = _executable_lines(
+        generate_submit_script(
+            output_remote=BareGitOutputRemote('/srv/out.git'), **_PUBLICATION_KWARGS
+        )
+    )
+    differing = [(a, b) for a, b in zip(ria, bare, strict=True) if a != b]
+    # Exactly one line, and it differs only in the sibling name: the command
+    # itself is the same for every receiver.
+    assert len(differing) == 1, differing
+    assert differing[0] == (
+        'git annex copy --to output-storage --in here .',
+        'git annex copy --to outputstore --in here .',
+    )

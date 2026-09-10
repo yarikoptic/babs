@@ -142,6 +142,21 @@ def _parse_init():
         metavar='ENTRY',
         help="Skip adding ENTRY to the generated .gitignore. Currently supported: 'logs'.",
     )
+    parser.add_argument(
+        '--output_remote',
+        '--output-remote',
+        type=str,
+        metavar='PATH_OR_URL',
+        help='Where the job results should be published (both the result branches and '
+        'the annexed result content). The value says what kind of endpoint it is: '
+        'a plain path or `ria+file://` URL is a RIA store; `file://.../x.git` is a bare '
+        'git repository; `file://.../x` is a repository with a worktree, configured to '
+        'accept pushes into its checked-out branch; anything BABS cannot reach as a path '
+        '(`ssh://`, `https://`, `user@host:path`, `ria+ssh://`) is an existing endpoint, '
+        'which is validated rather than created and must already be a git-annex '
+        'repository. Local endpoints are created if they do not exist. '
+        'By default, BABS creates and uses an output RIA store inside the project root.',
+    )
 
     return parser
 
@@ -175,6 +190,7 @@ def babs_init_main(
     throttle: int | None = None,
     shared_group: str | None = None,
     no_ignore: list | None = None,
+    output_remote: str | None = None,
 ):
     """This is the core function of babs init.
 
@@ -213,6 +229,11 @@ def babs_init_main(
         with `--shared group --group <GROUP>`.
     no_ignore: list or None, optional
         List of entries to omit from the generated .gitignore. Supported: 'logs'.
+    output_remote: str or None, optional
+        Where to publish the job results: a path or `ria+*` URL for a RIA store,
+        a `file://` URL for a git repository BABS manages, or any other git URL
+        for an existing endpoint that is validated rather than created.
+        `None` (the default) keeps the in-project output RIA store.
     """
 
     from babs import BABSBootstrap
@@ -228,6 +249,7 @@ def babs_init_main(
             throttle=throttle,
             shared_group=shared_group,
             no_ignore=no_ignore,
+            output_remote=output_remote,
         )
     except Exception:
         print('\n`babs init` failed! Below is the error message:')

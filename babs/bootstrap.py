@@ -15,6 +15,7 @@ from jinja2 import Environment, PackageLoader, StrictUndefined
 from babs.base import BABS
 from babs.container import Container
 from babs.input_datasets import InputDatasets
+from babs.output_remote import make_output_remote
 from babs.status import create_initial_statuses, write_job_status_csv
 from babs.system import System, validate_queue
 from babs.utils import (
@@ -44,6 +45,7 @@ class BABSBootstrap(BABS):
         throttle=None,
         shared_group=None,
         no_ignore=None,
+        output_remote=None,
     ):
         """
         Bootstrap a babs project: initialize datalad-tracked RIAs, generate scripts to be used, etc
@@ -76,8 +78,16 @@ class BABSBootstrap(BABS):
             with `--shared group --group <GROUP>`.
         no_ignore: list or None, optional
             List of entries to omit from the generated .gitignore. Supported: 'logs'.
+        output_remote: str or None, optional
+            Path to a plain bare git repository that should receive the job
+            results (both the result branches and the annexed content). If it
+            does not exist yet it is created. When ``None`` (the default),
+            BABS creates and uses an output RIA store inside the project root,
+            exactly as before.
         """
         container_config = container_config or self.container_config
+        # Decide where results will be published before anything is created.
+        self.output_remote = make_output_remote(self.output_ria_path, output_remote)
 
         if op.exists(self.project_root):
             raise FileExistsError(
@@ -173,17 +183,12 @@ class BABSBootstrap(BABS):
             gitignore_file.write('\n')
         self.datalad_save(path='.gitignore', message='Save .gitignore file')
 
-        # Create output RIA sibling: -----------------------------
+        # Create output sibling: ---------------------------------
         print('\nCreating output and input RIA...')
         sibling_kwargs = {}
         if self.shared_group is not None:
             sibling_kwargs = {'shared': 'group', 'group': self.shared_group}
-        self.analysis_datalad_handle.create_sibling_ria(
-            name='output',
-            url=self.output_ria_url,
-            new_store_ok=True,
-            **sibling_kwargs,
-        )
+        self.output_remote.create_sibling(self.analysis_datalad_handle, sibling_kwargs)
 
         self.wtf_key_info()
 
@@ -286,6 +291,7 @@ class BABSBootstrap(BABS):
                     container_name=container_name,
                     container_ds=container_ds,
                     container_images=container_images,
+                    output_remote=self.output_remote.to_config(),
                 )
             )
         self.datalad_save(
@@ -440,23 +446,14 @@ class BABSBootstrap(BABS):
         self.analysis_datalad_handle.push(to='input')
         self.analysis_datalad_handle.push(to='output')
 
-        # Add an alias to the data in output RIA store:
-        print("Adding an alias 'data' to output RIA store...")
-        """
-        RIA_DIR=$(find $PROJECTROOT/output_ria/???/ -maxdepth 1 -type d | sort | tail -n 1)
-        mkdir -p ${PROJECTROOT}/output_ria/alias
-        ln -s ${RIA_DIR} ${PROJECTROOT}/output_ria/alias/data
-        """
-        if not op.exists(op.join(self.output_ria_path, 'alias')):
-            os.makedirs(op.join(self.output_ria_path, 'alias'))
-        # create a symbolic link:
-        the_symlink = op.join(self.output_ria_path, 'alias', 'data')
-        if op.exists(the_symlink) & op.islink(the_symlink):
-            # exists and is a symlink: remove first
-            os.remove(the_symlink)
-        os.symlink(self.output_ria_data_dir, the_symlink)
+        # Any post-push setup of the output remote. For the RIA default this
+        # adds the alias to the data in the output RIA store:
+        #   RIA_DIR=$(find $PROJECTROOT/output_ria/???/ -maxdepth 1 -type d | sort | tail -n 1)
+        #   mkdir -p ${PROJECTROOT}/output_ria/alias
+        #   ln -s ${RIA_DIR} ${PROJECTROOT}/output_ria/alias/data
         # to check this symbolic link, just: $ ls -l <output_ria/alias/data>
         #   it should point to /full/path/output_ria/xxx/xxx-xxx-xxx-xxx
+        self.output_remote.finalize(self.output_ria_data_dir)
 
         # Initialize the job status csv file:
         self._create_initial_job_status_csv()
@@ -512,6 +509,7 @@ class BABSBootstrap(BABS):
             system,
             analysis_path=self.analysis_path,
             shared_group_mode=shared_group_mode,
+            output_remote=self.output_remote,
         )
 
         # also, generate a bash script of a test job used by `babs check-setup`:
@@ -585,6 +583,7 @@ class BABSBootstrap(BABS):
             container_images=container_images,
             datalad_run_message='pipeline',
             analysis_path=self.analysis_path,
+            output_remote=self.output_remote,
         )
 
         with open(bash_path, 'w') as f:
@@ -696,6 +695,22 @@ class BABSBootstrap(BABS):
                     self.analysis_datalad_handle.push(to='input')
                 if op.exists(self.output_ria_path):
                     self.analysis_datalad_handle.push(to='output')
+
+            # An output remote outside `project_root` is not ours to delete;
+            # say where it is instead of silently leaving it behind.
+            external_output = getattr(self.output_remote, 'repo_path', None)
+            if (
+                external_output is not None
+                and op.exists(external_output)
+                and not Path(external_output)
+                .resolve()
+                .is_relative_to(Path(self.project_root).resolve())
+            ):
+                print(
+                    '\nNOTE: the output remote is outside this BABS project and will NOT'
+                    ' be removed. If you want it gone, remove it yourself:'
+                    f'\n    rm -rf {external_output}'
+                )
 
             # Now we can delete this project folder:
             print('\nDeleting created BABS project folder...')

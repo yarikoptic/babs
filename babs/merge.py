@@ -11,6 +11,7 @@ import warnings
 import datalad.api as dlapi
 
 from babs.base import BABS
+from babs.git_endpoint import delete_result_branches
 from babs.utils import get_git_show_ref_shasum
 
 
@@ -141,13 +142,18 @@ class BABSMerge(BABS):
         # ^^ this will be absolutely used if `babs merge` does not fail:
         fn_msg_fsck = op.join(merge_ds_path, 'code', 'log_git_annex_fsck.txt')
 
-        # Clone output RIA to `merge_ds`:
+        # Clone the output remote to `merge_ds`:
         print("Cloning output RIA to 'merge_ds'...")
-        # get the path to output RIA:
+        # For the RIA default this is
         #   'ria+file:///path/to/BABS_project/output_ria#0000000-000-xxx-xxxxxxxx'
-        output_ria_source = self.output_ria_url + '#' + self.analysis_dataset_id
+        output_ria_source = self.output_remote.clone_source(
+            self.output_git_url, self.analysis_dataset_id
+        )
         # clone: `datalad clone ${outputsource} merge_ds`
         dlapi.clone(source=output_ria_source, path=merge_ds_path)
+
+        # The git-annex remote that holds the result content, as `merge_ds` sees it:
+        content_remote = self.output_remote.merge_content_remote
 
         # List all branches in output RIA:
         print('\nListing all branches in output RIA...')
@@ -185,6 +191,10 @@ class BABSMerge(BABS):
         #   that's different from current git commit SHASUM (`git_ref`):
         list_branches_no_results = []
         list_branches_with_results = []
+        # Remember exactly which commit of each branch we are about to merge, so
+        # the post-merge deletion can be leased against it and never discard a
+        # branch that moved (or was re-pushed) in the meantime.
+        merged_branch_oids = {}
         for branch_job in list_branches_jobs:
             # get the job's `git show-ref` (in merge_ds clone refs are remote: origin/job-*):
             branch_ref = 'origin/' + branch_job
@@ -193,6 +203,7 @@ class BABSMerge(BABS):
                 list_branches_no_results.append(branch_job)
             else:  # has results:
                 list_branches_with_results.append(branch_job)
+                merged_branch_oids[branch_job] = git_ref_branch_job
 
         # check if there is any valid job (with results):
         if len(list_branches_with_results) == 0:  # empty:
@@ -294,7 +305,7 @@ class BABSMerge(BABS):
         #   now we need to match the symlinks with the data content in `output-storage`.
         #   `--fast`: just use the existing MD5, not to re-create a new one
         proc_git_annex_fsck = subprocess.run(
-            ['git', 'annex', 'fsck', '--fast', '-f', 'output-storage'],
+            ['git', 'annex', 'fsck', '--fast', '-f', content_remote],
             cwd=merge_ds_path,
             stdout=subprocess.PIPE,
             check=True,
@@ -305,7 +316,8 @@ class BABSMerge(BABS):
         # instead, save it into a text file:
         with open(fn_msg_fsck, 'w') as f:
             f.write(
-                '# Below are printed messages from `git annex fsck --fast -f output-storage`:\n\n'
+                '# Below are printed messages from '
+                f'`git annex fsck --fast -f {content_remote}`:\n\n'
             )
             f.write(proc_git_annex_fsck.stdout.decode('utf-8'))
             f.write('\n')
@@ -316,7 +328,7 @@ class BABSMerge(BABS):
         #   This should not print anything - we never has this error before
         # `git annex find --not --in output-storage`
         proc_git_annex_find_missing = subprocess.run(
-            ['git', 'annex', 'find', '--not', '--in', 'output-storage'],
+            ['git', 'annex', 'find', '--not', '--in', content_remote],
             cwd=merge_ds_path,
             stdout=subprocess.PIPE,
             check=True,
@@ -372,13 +384,24 @@ class BABSMerge(BABS):
         print('\nCleaning up merge_ds directory...')
         robust_rm_dir(merge_ds_path)
 
-        # Delete all the merged branches from the output RIA
+        # Delete all the merged branches from the output remote.
+        # This is a `git push --delete` against the endpoint URL rather than
+        # `git branch --delete` in a local checkout, so it also works when the
+        # output remote is not a directory on this machine. Each deletion
+        # carries an expected-OID lease: `git branch --delete` refuses to drop
+        # an *unmerged* branch, and a lease only checks the object id, so the
+        # merge commit is pushed above (before anything is deleted) and the
+        # lease guards against the branch having moved since we merged it.
         for n_chunk, chunk in enumerate(all_chunks):
             print(f'Deleting merged branches for chunk #{n_chunk + 1}...')
-            proc_git_branch_delete = subprocess.run(
-                ['git', 'branch', '--delete'] + chunk,
-                cwd=self.output_ria_data_dir,
-                stdout=subprocess.PIPE,
-                check=True,
+            print(
+                delete_result_branches(
+                    self.output_git_url,
+                    {branch: merged_branch_oids[branch] for branch in chunk},
+                    # `git push` needs a repository to run from, even when the
+                    # destination is an explicit URL. Without this it inherits
+                    # the user's shell cwd -- and fails outright when that is
+                    # not a git repository, which `cd ~ && babs merge …` is.
+                    cwd=self.analysis_path,
+                )
             )
-            print(proc_git_branch_delete.stdout.decode('utf-8'))

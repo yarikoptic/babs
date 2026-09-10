@@ -6,13 +6,15 @@ import os.path as op
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import urlparse
 
 import datalad.api as dlapi
 import pandas as pd
 import yaml
 
+from babs import resource
+from babs.git_endpoint import list_result_branches
 from babs.input_datasets import InputDatasets, OutputDatasets
+from babs.output_remote import make_output_remote, output_remote_from_config
 from babs.scheduler import (
     request_all_job_status,
     run_squeue,
@@ -28,7 +30,6 @@ from babs.utils import (
     combine_inclusion_dataframes,
     container_image_path,
     get_latest_submitted_jobs_columns,
-    get_results_branches,
     identify_running_jobs,
     read_yaml,
     results_status_columns,
@@ -94,9 +95,16 @@ class BABS:
             URL of input RIA store, starting with "ria+file://".
         output_ria_url: str
             URL of output RIA store, starting with "ria+file://".
+        output_remote: babs.output_remote.OutputRemote
+            Where this project publishes results. Defaults to the in-project
+            output RIA store; `babs init --output-remote` selects a plain bare
+            git repository instead.
         output_ria_data_dir: str
-            Path to the output RIA's data directory.
-            Example: /full/path/to/project_root/output_ria/238/da2f2-2fc4-4b88-a2c5-aa6e754b5d0b
+            The git endpoint that receives result branches, as recorded by the
+            `output` sibling. For the RIA default this is the store's data
+            directory, e.g.
+            /full/path/to/project_root/output_ria/238/da2f2-2fc4-4b88-a2c5-aa6e754b5d0b;
+            for `--output-remote` it is that bare repository.
         analysis_dataset_id: str
             The ID of DataLad dataset `analysis`.
             This will be used to get the full path to the dataset in input RIA.
@@ -156,6 +164,10 @@ class BABS:
         self.input_ria_url = 'ria+file://' + self.input_ria_path
         self.output_ria_url = 'ria+file://' + self.output_ria_path
 
+        # Where results get published. Replaced from `babs_proj_config.yaml`
+        # in `_apply_config()`, or from the CLI flag during `babs init`.
+        self.output_remote = make_output_remote(self.output_ria_path)
+
         self.output_ria_data_dir = None  # not known yet before output_ria is created
         self.analysis_dataset_id = None  # to update later
 
@@ -212,7 +224,13 @@ class BABS:
             self._validate_pipeline_config()
         self.container_images = self.get_container_image_paths(config_yaml)
 
-        # Check the output RIA:
+        # Where this project publishes results. Projects created before
+        # `--output-remote` existed have no such section: that is the RIA default.
+        self.output_remote = output_remote_from_config(
+            self.output_ria_path, config_yaml.get('output_remote')
+        )
+
+        # Check the output remote:
         self.wtf_key_info(flag_output_ria_only=True)
 
         self.input_datasets = InputDatasets(self.processing_level, config_yaml['input_datasets'])
@@ -356,16 +374,13 @@ class BABS:
             stdout=subprocess.PIPE,
             check=True,
         )
-        self.output_ria_data_dir = urlparse(
-            proc_output_ria_data_dir.stdout.decode('utf-8')
-        ).path.strip()
-
-        # If the URL points to the RIA store root (no .git there), resolve to the
-        # actual dataset git dir via the alias symlink (e.g. output_ria/alias/data -> XX/xxx-uuid).
-        if not op.exists(op.join(self.output_ria_data_dir, '.git')):
-            alias_link = op.join(self.output_ria_path, 'alias', 'data')
-            if op.exists(alias_link) and os.path.islink(alias_link):
-                self.output_ria_data_dir = op.realpath(alias_link)
+        # Keep the recorded push URL *whole*. It used to be passed through
+        # `urlparse(...).path`, which is a no-op for the `ria+file` default
+        # (datalad records a bare path there) but silently drops `user@host`
+        # from anything with a scheme -- and that value is handed to every job
+        # verbatim as `pushgitremote`.
+        recorded_push_url = proc_output_ria_data_dir.stdout.decode('utf-8').strip()
+        self.output_ria_data_dir = self.output_remote.resolve_git_endpoint(recorded_push_url)
 
         if not flag_output_ria_only:  # also want other information:
             # Get the dataset ID of `analysis`, i.e., `analysis_dataset_id`:
@@ -384,17 +399,7 @@ class BABS:
     @staticmethod
     def source_to_local_path(source: str) -> str | None:
         """Convert a local dataset source URL/path to a filesystem path."""
-        if not source:
-            return None
-        if source.startswith('ria+file://'):
-            local_path = source[len('ria+file://') :]
-        elif source.startswith('file://'):
-            local_path = source[len('file://') :]
-        elif '://' not in source:
-            local_path = source
-        else:
-            return None
-        return local_path.split('#', 1)[0]
+        return resource.local_path(source)
 
     def analysis_git_config_path(self) -> str | None:
         """Return absolute path to analysis git config file."""
@@ -461,6 +466,11 @@ class BABS:
         alias_data = op.join(self.output_ria_path, 'alias', 'data')
         if op.exists(alias_data):
             safe_dirs.add(op.realpath(alias_data))
+
+        # A non-RIA output remote is a repository of its own, outside the store roots.
+        bare_repo_path = getattr(self.output_remote, 'repo_path', None)
+        if bare_repo_path is not None and op.exists(bare_repo_path):
+            safe_dirs.add(op.realpath(bare_repo_path))
 
         if hasattr(self, 'input_datasets'):
             for in_ds in self.input_datasets:
@@ -553,9 +563,25 @@ class BABS:
             # ^^ "notneeded": nothing to save
             raise RuntimeError('`datalad save` failed!')
 
+    @property
+    def output_git_url(self) -> str:
+        """The git endpoint that receives result branches (a path or a URL)."""
+        return self.output_ria_data_dir
+
+    def _get_result_branch_oids(self) -> dict:
+        """Map each result branch of the output remote to its commit hash.
+
+        Uses ``git ls-remote``, so it works for an endpoint that is not a
+        local directory.  It raises rather than returning an empty mapping if
+        the endpoint cannot be reached: a transport failure reported as "no
+        results" would make `babs status` claim no job ever finished and
+        `babs merge` refuse to merge results that do exist.
+        """
+        return list_result_branches(self.output_git_url)
+
     def _get_results_branches(self) -> list[str]:
-        """Get the results branch names from the output RIA in a list."""
-        return get_results_branches(self.output_ria_data_dir)
+        """Get the results branch names from the output remote in a list."""
+        return sorted(self._get_result_branch_oids())
 
     def _update_results_status(self) -> dict:
         """Update job statuses from external sources and write to CSV.

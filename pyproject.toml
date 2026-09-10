@@ -162,6 +162,20 @@ inline-quotes = "single"
 quote-style = "single"
 exclude = ["docs/conf.py"]
 
+[tool.mypy]
+python_version = "3.10"
+# Only the modules added by the output-remote work are annotated so far, so
+# only those are checked: a repo-wide run would be noise rather than a gate.
+files = ["babs/resource.py", "babs/git_endpoint.py", "babs/output_remote.py"]
+strict = true
+# Modules these import are read for their types but not themselves reported
+# on, so this stays a gate on the new code rather than the whole tree.
+follow_imports = "silent"
+# datalad ships no type information, and `babs._version` is generated at build.
+[[tool.mypy.overrides]]
+module = ["datalad.*", "babs._version"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 addopts = '-m "not integration"'
 markers = []

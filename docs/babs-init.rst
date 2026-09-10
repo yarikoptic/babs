@@ -113,6 +113,75 @@ a SLURM cluster:
     e.g., ``--array=1-${max_array}%10``.
 
 .. note::
+    **Publishing results somewhere other than an output RIA store**: by default
+    ``babs init`` creates an output RIA store inside the BABS project root, and
+    results are published to it over two channels -- the result branches go to a
+    bare git repository inside the store, and the zipped results go to an ORA
+    special remote.
+
+    ``--output-remote`` says where to publish instead, and the shape of the
+    value says what kind of endpoint it is:
+
+    ==================================== =========================================
+    ``--output-remote``                  what BABS does
+    ==================================== =========================================
+    (omitted)                            creates an output RIA store in the project
+    ``/path/to/store``                   creates/uses a RIA store there
+    ``ria+file:///path/to/store``        the same, said explicitly
+    ``ria+ssh://host/path/to/store``     a RIA store datalad reaches over ssh
+    ``file:///path/to/out.git``          creates/uses a **bare** git repository
+    ``file:///path/to/out``              creates/uses a repository **with a worktree**
+    ``ssh://…``, ``user@host:path``      an **existing** repository, validated only
+    ==================================== =========================================
+
+    An existing endpoint is believed over its name: point ``--output-remote``
+    at a directory that already holds a RIA store, a bare repository or a
+    repository with a worktree, and BABS uses it as what it is.
+
+    ::
+
+        babs init \
+            --container_ds /path/to/container-ds \
+            --container_name mriqc-24-0-2 \
+            --container_config /path/to/container_mriqc.yaml \
+            --processing_level subject \
+            --queue slurm \
+            --output-remote file:///path/to/output.git \
+            /path/to/my_BABS_project
+
+    For a git repository (bare or not), one endpoint carries **both**
+    publication channels: the result branches and the annexed zip files. A
+    local one is created if it does not exist, and BABS runs ``git annex init``
+    in it. That step is not cosmetic: a repository with no ``annex.uuid`` is
+    treated by git-annex as a git-only remote, and result *content* is then
+    silently not transferred at all, leaving result branches that point at zip
+    files stored nowhere.
+
+    A repository **with a worktree** is configured with
+    ``receive.denyCurrentBranch=updateInstead`` and
+    ``receive.denyNonFastforwards=true``, so pushes into its checked-out branch
+    are accepted and update the working tree -- the results become readable in
+    place, without a clone. Two consequences: such a push is refused while that
+    working tree is dirty, and since jobs only ever push ``job-*`` branches,
+    the checkout advances when ``babs merge`` pushes the main branch, not once
+    per job.
+
+    A **remote** endpoint (anything BABS cannot reach as a filesystem path) is
+    never created: BABS cannot run ``git annex init`` over a git transport, so
+    it validates instead. The endpoint must be reachable and must already
+    advertise a ``git-annex`` branch, which is what tells an annex-capable host
+    (forgejo-aneksajo, GIN, or any repository someone ran ``git annex init``
+    in) from a plain git host that would drop the content. Note that the
+    compute nodes need their own non-interactive credentials for that endpoint
+    -- an ssh key or a token in a git credential helper -- which is site and
+    user configuration, not something BABS arranges.
+
+    Everything else is unchanged: ``babs status``, ``babs merge`` and a
+    ``datalad clone`` of the endpoint work the same way, and jobs still push
+    content first and the result branch last. ``babs check-setup`` re-checks
+    the setup either way.
+
+.. note::
     **Shared group permissions**: On multi-user shared filesystems:
 
     #. **Set ``umask 002``** in your shell startup (for example ``~/.bashrc``). This is
